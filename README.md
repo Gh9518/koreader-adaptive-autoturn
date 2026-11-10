@@ -30,6 +30,7 @@ A few decisions follow from that idea:
 | **Silent until you opt in** | Opening a book produces no prompt. The patch only steps in at the moment **you** switch AutoTurn on. |
 | **Keep reasonable samples** | Only genuinely anomalous gaps are dropped. No recency weighting: people tend to read faster as they warm up, and weighting recent samples would bias the result toward turning pages too quickly. A whole-period mean keeps the calm, realistic pace. |
 | **Fail soft** | Every `require`, interface probe, widget call and hook is wrapped in `pcall`. If a symbol is missing or a KOReader version differs, the patch logs a warning and steps aside — it can never prevent KOReader from starting. |
+| **Native power management** | AutoTurn's own `_start()` / `_unschedule()` pair owns `PluginShare.pause_auto_suspend`. The patch never writes that flag directly, so the device keeps its normal auto-suspend behaviour during collection and after a cancel. |
 
 ---
 
@@ -67,6 +68,16 @@ Only *anomalies* are removed; everything in a reasonable range is kept, then ave
 Deliberately **not** used: two-sided IQR, discarding short reading fragments, and recency weighting. The first two erase legitimately slow pages and push the mean down; the third follows the natural warm-up speed-up and pushes it down as well. Both make pages turn too fast. The final value is clamped to 3–120 seconds and rounded.
 
 Only adjacent forward turns count. Jumps, back-flips, table-of-contents / bookmark / search navigation, scan-mode bursts and auto-generated turns are excluded. Timings use KOReader's monotonic clock, so a sleep/wake cycle cannot distort a sample.
+
+### Power and sleep/wake behaviour
+
+Sleep/wake cycles are the hardest case for any timer-driven patch, so this part is deliberately conservative:
+
+- **The power flag belongs to AutoTurn.** The patch never sets `PluginShare.pause_auto_suspend` itself. Enabling goes through AutoTurn's native `_start()`, and suspending or cancelling through `_unschedule()`, so the flag is always balanced and the device keeps its normal auto-suspend behaviour.
+- **Two clocks, one authoritative deadline.** KOReader's `scheduleIn` uses `CLOCK_MONOTONIC`, which does not tick while the device sleeps. The patch therefore treats a wall-clock monotonic deadline from `UIManager:getElapsedTimeSinceBoot()` as authoritative for both the page hint and the 30-minute safety timeout; the scheduled tasks are only "wake me up and re-check" triggers. A long lock-screen session cannot stretch the 30-minute timeout into an hour.
+- **Timers are cancelled on suspend.** On `onSuspend` both scheduled tasks are unscheduled and the page-turn timing baseline is cleared. On `onResume` they are rebuilt from the remaining time, or collection is settled immediately if the deadline has already passed. Gaps that span a sleep are never counted as reading samples.
+- **No orphan timers.** Opening a book, closing a document, switching books, aborting, settling and suspending all clear both task handles unconditionally.
+- **Re-entrancy safe.** AutoTurn's `_schedule()` can dispatch a page turn synchronously and re-enter the event handler — for example when a menu interrupts an auto-turn. The patch marks that window with a counter instead of a boolean, so nested scheduling cannot misclassify an auto-turn as a manual sample.
 
 ---
 
@@ -122,12 +133,14 @@ The only persistent state is one entry in `G_reader_settings.adaptive_autoturn`,
 
 The patch creates no directories, writes no files and sends no data anywhere. Raw turn intervals live only in memory during collection and are discarded afterwards. To forget the learned value, remove the `adaptive_autoturn` entry from `settings.reader.lua`.
 
+Enabling AutoTurn also updates AutoTurn's own `autoturn_timeout_seconds` / `autoturn_enabled` settings and re-attaches its `onResume` handler. Those are native AutoTurn settings, not extra data created by the patch.
+
 ---
 
 ## Compatibility and limitations
 
 - Written in plain **Lua 5.1** with zero global writes.
-- Interfaces are probed at runtime against real KOReader symbols (`ReaderReady`, `PageUpdate`, AutoTurn fields and `_schedule` / `_unschedule`, `UIManager`, widgets) rather than hard-coded. If a future KOReader release changes them, the patch detects the mismatch and quietly disables itself instead of breaking startup.
+- Interfaces are probed at runtime against real KOReader symbols (`ReaderReady`, `PageUpdate`, AutoTurn fields and `_schedule` / `_unschedule` / `_start`, `UIManager:getElapsedTimeSinceBoot()`, `onSuspend` / `onResume`, widgets) rather than hard-coded. If a future KOReader release changes them, the patch detects the mismatch and quietly disables itself instead of breaking startup.
 - **Paged view only.** Switching to scroll mode aborts collection with a message.
 - The learned interval is global. If your pace differs sharply between, say, comics and dense prose, use *Set manually* for those sessions.
 - Not tested on every device and KOReader version combination. Reports about specific firmware and plugin versions are very welcome.

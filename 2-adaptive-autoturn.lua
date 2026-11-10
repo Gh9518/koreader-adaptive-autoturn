@@ -65,8 +65,13 @@
     两者都拿不到才 logger.warn 并放弃拦截（此时补丁静默，不影响原生行为）。
     挂起/恢复一律用 pcall 探测到的真实字段与方法（enabled + autoturn_sec +
     _unschedule/_schedule），绝不硬编码不存在的符号。
-    「使用已有数据/重新训练/手动设置」用字段级开启 + _schedule() 复刻原生
-    开启逻辑，刻意不调 _start()（它会弹原生 InfoMessage，避免重复提示）。
+    「使用已有数据/重新训练/手动设置」的开启交回 AutoTurn 原生路径：补齐
+    原生 callback 的三项副作用（写 autoturn_timeout_seconds / autoturn_enabled、
+    挂 self.onResume = self._onResume），再 _unschedule() + _start()，让
+    PluginShare.pause_auto_suspend 由原生 _start(true)/_unschedule(false) 成对
+    管理。补丁绝不单边写这个全局标志，否则设备会一直无法自动待机，与电源
+    管理争用（锁屏/唤醒卡死根因）。采集期挂起时把 onResume 摘掉并存入快照，
+    避免唤醒时原生 _start 把自动翻页重新打开。
   * 页面事件：ReaderPaging 派发 PageUpdate(number, orig_mode)（:1150），
     ReaderRolling 派发 PageUpdate(page)（:1097 等）。两者都在真实翻页时派发
     PageUpdate，故本补丁以 PageUpdate 为唯一页码信号；PosUpdate 是「位置」级
@@ -78,10 +83,15 @@
     auto_firing 标记（包裹 AutoTurn._schedule）单独识别。
   * 滚动模式：真实判定是 ui.view.view_mode == "scroll"（readerrolling.lua），
     命中即中止采集并提示（A1）。
-  * 时间：采样间隔 dt、倒计时统一用 UIManager:getElapsedTimeSinceBoot()
-    单调时钟，经 ui/time.to_number() 转秒，避免休眠唤醒后的墙上时间跳变污染
-    样本；AutoTurn.last_action_time 的比较发生在 fts 域，回填时保留原始值。
-    本补丁不写任何文件，也不依赖墙上时间。
+  * 时间：采样间隔 dt、采集截止 collect_end、页面提示截止 hint_end 统一用
+    UIManager:getElapsedTimeSinceBoot()（= CLOCK_MONOTONIC + 累计待机时长，
+    即含休眠的墙上单调时钟），经 ui/time.to_number() 转秒。UIManager:scheduleIn
+    用纯 CLOCK_MONOTONIC（休眠期间不走），KOReader 唤醒时会平移任务队列，
+    因此补丁的两个定时任务只是「到点叫醒复核」的触发器，是否真正到点一律
+    用 collect_end / hint_end 判定，锁屏再久也不会把 30 分钟拖成 57 分钟。
+    onSuspend 撤销两个任务、onResume 按剩余时长重建，且不与 AutoTurn 原生
+    _start() 重排的 task 叠加。AutoTurn.last_action_time 的比较发生在 fts 域，
+    回填时保留原始值。本补丁不写任何文件。
   * ButtonDialog 的按钮回调不会自动关闭（buttontable.lua:80-85 只调
     btn_entry.callback），必须显式 UIManager:close(dlg)；ConfirmBox 才会自动关。
     ButtonTable 支持 enabled=false 置灰按钮（button.lua:485）。InputDialog
@@ -123,7 +133,13 @@
   * 过滤与统计拆成独立纯函数（sorted_copy / quantile / mean /
     trim_outliers / compute_learned），便于离线单测。
   * 唯一持久状态是 G_reader_settings.adaptive_autoturn；不创建目录、不写文件、
-    不依赖 lfs、不改 Autoturn 源文件。
+    不依赖 lfs、不改 Autoturn 源文件。开启时另由 AutoTurn 原生 _start() 维护
+    它自己的 autoturn_enabled / autoturn_timeout_seconds 与 PluginShare 标志。
+  * 定时器生命周期：clear_timers() 统一撤销 hint_task / collect_task；开新书、
+    关文档、换书 detach、结算、中止、休眠都无条件调用，杜绝幽灵任务。
+  * 防自激 auto_firing 用计数：_schedule 内同步派发 GotoViewRel 会重入
+    handleEvent，菜单打断 / 嵌套调度时布尔会被内层提前清掉，计数保证整段
+    窗口都被识别为自动翻页，不会误计入手动样本。
   * 删除补丁文件后，运行时包裹随进程消失，Autoturn 恢复原生行为。
 ==========================================================================]]
 
@@ -141,7 +157,6 @@ local ok_gettext, gettext   = pcall(require, "gettext")
 -- 某个 for _, x 循环体内调用翻译就会被遮蔽成数字而报错。
 local L = (ok_gettext and type(gettext) == "function") and gettext
           or function(s) return s end
-local ok_ps, pluginshare   = pcall(require, "pluginshare")
 local ok_pl, PluginLoader  = pcall(require, "pluginloader")
 local ok_up, userpatch     = pcall(require, "userpatch")
 
@@ -379,15 +394,34 @@ local S = {
     last_sig_page = nil,    -- PageUpdate 去重：同页短时窗只记一次
     last_sig_ts   = nil,
     burst       = 0,        -- 连续 dt<min_interval 计数
-    collect_end = nil,      -- 兜底超时截止单调时刻（train_timeout_min 分钟）
+    collect_end = nil,      -- 兜底超时截止时刻（getElapsedTimeSinceBoot，含待机的墙上单调时钟）
     collect_task = nil,     -- 兜底超时倒计时任务句柄（采够样本会提前撤销）
     hint_task   = nil,      -- 「页面提示」自动关闭后启动采集的任务句柄
+    hint_end    = nil,      -- 页面提示截止时刻（休眠唤醒后按剩余重建 hint_task）
     suspend_snapshot = nil,
 
-    -- 防自激
-    auto_firing = false,
+    -- 休眠：挂起时撤销两个定时任务，唤醒时按剩余时长重建（避免休眠期任务与
+    -- 原生 _start() 重排的 task 叠加，也避免单调时钟冻结导致倒计时被拖长）。
+    suspended_phase = nil,  -- 挂起时正处于 pending / collecting
+
+    -- 防自激：计数而非布尔。_schedule 内会同步派发 GotoViewRel 再重入
+    -- handleEvent，嵌套时布尔会被内层提前清掉；计数保证整段窗口都被识别。
+    auto_firing = 0,
     probe       = {},
 }
+
+-- 统一撤销补丁自己排定的两个定时任务。换书、关文档、休眠、结算、中止都要
+-- 无条件调用，杜绝幽灵任务泄漏到下一本书或下一轮唤醒。
+local function clear_timers()
+    if S.hint_task then
+        pcall(UIManager.unschedule, UIManager, S.hint_task)
+        S.hint_task = nil
+    end
+    if S.collect_task then
+        pcall(UIManager.unschedule, UIManager, S.collect_task)
+        S.collect_task = nil
+    end
+end
 
 -- ---------------------------------------------------------------- 探测 ------
 local SWITCH_ENABLE  = { "enable", "setEnabled", "toggle", "onEnable" }
@@ -528,40 +562,65 @@ local function suspend_autoturn(inst)
         enabled          = inst.enabled,
         autoturn_sec     = inst.autoturn_sec,
         last_action_time = inst.last_action_time,
+        onResume         = inst.onResume, -- 采集期必须摘掉，避免唤醒时原生 _start 重启自动翻页
     }
     inst.enabled = false
     inst.autoturn_sec = CFG.suspend_sec
+    inst.onResume = nil
     call_unschedule(inst)
     logger.info("aat: autoturn suspended (switch=", tostring(used), ")")
 end
 
--- 恢复：设置间隔 + 开启；优先探测到的开启接口，字段级兜底后重排调度。
--- 刻意不调 _start()（会弹原生 InfoMessage），避免与补丁自己的提示重复。
+-- 开启：把 AutoTurn 原生菜单 callback 的副作用补齐，再交回原生 _start()
+-- 完成调度与待机标志的成对管理。补丁一律不直接写 PluginShare.pause_auto_suspend：
+-- 它由 _start()(true) / _unschedule()(false) 成对维护；补丁单边只置 true，
+-- 设备会一直无法自动待机，并与电源管理 / 其他插件争用（锁屏唤醒卡死根因）。
 local function resume_autoturn(inst, sec)
     sec = math.floor(clamp(sec, CFG.min_sec, CFG.max_sec) + 0.5)
-    inst.autoturn_sec = sec
-    inst.enabled = true
-    local used = nil
+
+    -- 兼容分支：老版本探测到的开关方法，之后再字段级二次钉死。
     local name = S.probe.switch_enable
     if name then
-        local ok = pcall(function()
+        pcall(function()
             if name == "setEnabled" then inst:setEnabled(true)
             elseif name == "toggle" then
                 if not is_enabled(inst) then inst:toggle() end
             else inst[name](inst) end
         end)
-        if ok then used = name end
     end
-    -- 官方开关内部可能改写字段，再钉死一次，确保读到学习值而非挂起值。
     inst.autoturn_sec = sec
     inst.enabled = true
+
+    -- 补写原生 callback 的持久化副作用：拦截菜单后原 callback 不执行，
+    -- 不补这两项，下次开书 init() 读回旧值，自动翻页会静默失效。
+    pcall(function()
+        if G_reader_settings and type(G_reader_settings.saveSetting) == "function" then
+            G_reader_settings:saveSetting("autoturn_timeout_seconds", sec)
+        end
+        if G_reader_settings and type(G_reader_settings.makeTrue) == "function" then
+            G_reader_settings:makeTrue("autoturn_enabled")
+        end
+        if G_reader_settings and type(G_reader_settings.flush) == "function" then
+            G_reader_settings:flush()
+        end
+    end)
+    -- 补挂唤醒回调：原生 callback 里 self.onResume = self._onResume。
+    -- 缺了它，锁屏唤醒后 AutoTurn 不会自己 _start() 恢复调度与待机标志。
+    pcall(function()
+        if type(inst._onResume) == "function" then inst.onResume = inst._onResume end
+    end)
+
+    -- 先撤旧调度（_unschedule 内置 pause_auto_suspend=false），再 _start()
+    -- （内置把 pause_auto_suspend 置真 + last_action_time + _schedule + 原生提示）。
     call_unschedule(inst)
-    pcall(function() inst.last_action_time = now_raw() or 0 end)
-    if ok_ps and type(pluginshare) == "table" then
-        pcall(function() pluginshare.pause_auto_suspend = true end)
+    if S.probe._start then
+        pcall(inst._start, inst)
+    else
+        -- 老版本没有 _start：字段级兜底重排，绝不碰全局待机标志。
+        pcall(function() inst.last_action_time = now_raw() or 0 end)
+        if S.probe._schedule then pcall(inst._schedule, inst) end
     end
-    if S.probe._schedule then pcall(inst._schedule, inst) end
-    logger.info("aat: autoturn enabled sec=", sec, "switch=", tostring(used))
+    logger.info("aat: autoturn enabled via native _start sec=", sec)
 end
 
 -- 仅还原挂起前的实例态，不动 G_reader_settings（不改其它模块持久状态）。
@@ -572,8 +631,10 @@ local function restore_autoturn(inst)
     inst.enabled          = snap.enabled
     inst.autoturn_sec     = snap.autoturn_sec
     inst.last_action_time = snap.last_action_time
+    inst.onResume         = snap.onResume
     call_unschedule(inst)
-    if is_enabled(inst) and S.probe._schedule then pcall(inst._schedule, inst) end
+    -- 挂起前若本就开启，交回原生 _start() 重建调度与待机标志（保持配对）。
+    if is_enabled(inst) and S.probe._start then pcall(inst._start, inst) end
     S.suspend_snapshot = nil
 end
 
@@ -591,7 +652,7 @@ end
 -- ---------------------------------------------------------------- 前向声明 --
 -- 采集流程与弹窗互相引用，统一前向声明后逐个赋值，避免任何全局函数。
 local on_page_changed, finish_collection, abort_collection,
-      start_collection, begin_collecting, show_manual_dialog,
+      start_collection, begin_collecting, arm_collect_task, show_manual_dialog,
       show_dialog_enable,
       action_use_learned, action_cancel_enable, apply_value
 
@@ -626,14 +687,16 @@ end
 -- ---------------------------------------------------------------- 采集 ------
 abort_collection = function(msg)
     if S.phase == "collecting" or S.phase == "pending" then
-        if S.hint_task then pcall(UIManager.unschedule, UIManager, S.hint_task) end
-        if S.collect_task then pcall(UIManager.unschedule, UIManager, S.collect_task) end
-        S.hint_task = nil
-        S.collect_task = nil
+        clear_timers()
         S.phase = "idle"
-        S.auto_firing = false
+        S.auto_firing = 0
         restore_autoturn(S.inst)
+    else
+        clear_timers()  -- 即便 idle 也清，杜绝任何残留句柄
     end
+    S.collect_end = nil
+    S.hint_end = nil
+    S.suspended_phase = nil
     S.suspend_snapshot = nil
     show_info(msg, 6)
 end
@@ -680,18 +743,46 @@ start_collection = function()
     S.last_sig_page = nil
     S.last_sig_ts = nil
     S.burst = 0
-    S.auto_firing = false
-    S.collect_task = nil
+    S.auto_firing = 0
+    S.collect_end = nil
+    S.hint_end = (now_s() or 0) + CFG.hint_timeout
+    S.suspended_phase = nil
 
     show_info(string.format(
         L("即将开始采集：采够 %d 个翻页间隔会自动结束（最长 %d 分钟）。本提示 %d 秒后自动关闭，之后开始分析采集；期间自动翻页已关闭，请正常手动翻页。"),
         CFG.target_samples, CFG.train_timeout_min, CFG.hint_timeout))
     logger.info("aat: page hint shown, collecting starts in ", CFG.hint_timeout, "s")
 
-    -- 只用一个任务句柄驱动「提示关闭 → 开始采集」，切书/中止时可 unschedule。
-    if S.hint_task then pcall(UIManager.unschedule, UIManager, S.hint_task) end
+    -- 只用一个任务句柄驱动「提示关闭 → 开始采集」，切书/中止/休眠时可 unschedule。
+    clear_timers()
     S.hint_task = function() begin_collecting() end
     pcall(UIManager.scheduleIn, UIManager, CFG.hint_timeout, S.hint_task)
+end
+
+-- 排（或重排）兜底超时任务。collect_end 基于 getElapsedTimeSinceBoot（含休眠的
+-- 墙上单调时钟）是权威截止；scheduleIn 用纯 CLOCK_MONOTONIC，休眠期间不走，
+-- 所以它只是「到点叫醒我复核」的触发器，真正是否到点一律用 collect_end 判定。
+-- 这样锁屏再久，唤醒后也能立刻发现已超时并结算，不会把 30 分钟拖成 57 分钟。
+arm_collect_task = function()
+    if S.phase ~= "collecting" then return end
+    if S.collect_task then pcall(UIManager.unschedule, UIManager, S.collect_task) end
+    local now = now_s() or 0
+    local remain = (S.collect_end or now) - now
+    if remain <= 0 then
+        finish_collection("timeout")
+        return
+    end
+    S.collect_task = function()
+        if S.phase ~= "collecting" then return end
+        local n2 = now_s() or 0
+        -- 任务被提前触发（KOReader 唤醒平移任务队列）时按剩余重排，不误结算。
+        if S.collect_end and n2 < S.collect_end - 0.5 then
+            arm_collect_task()
+            return
+        end
+        finish_collection("timeout")
+    end
+    pcall(UIManager.scheduleIn, UIManager, remain, S.collect_task)
 end
 
 -- 页面提示自动关闭后：真正进入 collecting，起兜底超时倒计时开始采样。
@@ -700,15 +791,14 @@ end
 begin_collecting = function()
     if S.phase ~= "pending" then return end
     S.hint_task = nil
+    S.hint_end = nil
     S.phase = "collecting"
     S.collect_end = (now_s() or 0) + CFG.train_timeout_min * 60
-    S.auto_firing = false
+    S.auto_firing = 0
+    S.suspended_phase = nil
     logger.info("aat: page hint closed, collection started, target=",
         CFG.target_samples, "timeout_min=", CFG.train_timeout_min)
-
-    -- 兜底超时只用一个任务句柄；采够样本时由 finish_collection 提前撤销。
-    S.collect_task = function() finish_collection("timeout") end
-    pcall(UIManager.scheduleIn, UIManager, CFG.train_timeout_min * 60, S.collect_task)
+    arm_collect_task()
 end
 
 -- ---------------------------------------------------------------- 弹窗 B ----
@@ -797,12 +887,13 @@ local function is_reader_foreground()
     return false
 end
 
--- A4 重排 / A6 休眠 / A5 绝对跳转：命中即重置计时，不入样本池。
+-- A4 重排 / A5 绝对跳转：命中即重置计时，不入样本池。
+-- onSuspend / onResume 单独在 on_event_after 里处理（撤销并重建定时任务），
+-- 不放在这里；它们需要比「重置计时」更完整的动作。
 -- 注意不含 onGotoViewRel（它是正常翻页事件）与 onPosUpdate（位置级事件）。
 local RESET_HANDLERS = {
     onSetDimensions = true, onUpdatePos = true, onDocumentRerendered = true,
     onBBoxUpdate = true, onRotationUpdate = true, onChangeScreenMode = true,
-    onSuspend = true, onResume = true,
     onGotoPage = true, onGotoPercent = true, onGotoPercentage = true,
     onGotoXPointer = true, onGotoPageLink = true, onGoToLink = true,
     onGotoLocation = true, onBookmarkGoTo = true,
@@ -821,6 +912,15 @@ on_page_changed = function(new_page, ts_mono)
     S.last_sig_page, S.last_sig_ts = new_page, ts_mono
 
     if S.phase ~= "collecting" then return end
+
+    -- ④ collect_end 权威判据：它与 ts_mono 同为 getElapsedTimeSinceBoot（含休眠
+    -- 的墙上单调时钟）。scheduleIn 用纯 CLOCK_MONOTONIC，休眠期间不走；即便它
+    -- 被冻结，唤醒后第一次翻页也会在这里按真实截止时刻立即结算，不会把
+    -- 30 分钟拖成 57 分钟。到点即结算，且不把这个跨休眠超长间隔计入样本。
+    if S.collect_end and ts_mono and ts_mono >= S.collect_end then
+        finish_collection("timeout")
+        return
+    end
 
     -- A1（采集期动态切换）：滚动模式中止采集。
     local scroll_now = false
@@ -897,11 +997,12 @@ end
 finish_collection = function(reason)
     if S.phase ~= "collecting" then return end
     S.phase = "idle"
-    if S.collect_task then
-        pcall(UIManager.unschedule, UIManager, S.collect_task)
-        S.collect_task = nil
-    end
-    S.auto_firing = false
+    -- 无条件撤销两个定时句柄；结算后不留任何幽灵任务（⑥）。
+    clear_timers()
+    S.collect_end = nil
+    S.hint_end = nil
+    S.suspended_phase = nil
+    S.auto_firing = 0
 
     local learned, why = compute_learned(S.samples)
     if learned then
@@ -936,7 +1037,13 @@ local function on_event_after(this, handler, args)
         -- 双保险：只在真正的 ReaderUI 实例上生效，避免文件管理器等界面误入。
         if type(this) ~= "table" or type(this.document) ~= "table" then return end
         S.ready_fired = true
+        -- 开新书：无条件撤销任何残留定时句柄、清空全部采集状态（⑥）。
+        clear_timers()
         S.phase = "idle"
+        S.auto_firing = 0
+        S.collect_end = nil
+        S.hint_end = nil
+        S.suspended_phase = nil
         S.samples = {}
         S.last_page = nil
         S.last_turn_ts = nil
@@ -951,17 +1058,58 @@ local function on_event_after(this, handler, args)
     end
 
     if handler == "onCloseDocument" then
-        -- 书籍关闭：撤销页面提示 / 采集倒计时、恢复 Autoturn，避免状态串到下一本。
+        -- ⑥ 书籍关闭：无条件撤销两个定时句柄并清空状态，无论当前 phase，
+        -- 避免残留任务 / 标志串到下一本书。暂停电源标志由 AutoTurn 原生
+        -- onCloseDocument→_unschedule 负责，本补丁不插手。
+        clear_timers()
         if S.phase == "collecting" or S.phase == "pending" then
-            if S.hint_task then pcall(UIManager.unschedule, UIManager, S.hint_task) end
-            if S.collect_task then pcall(UIManager.unschedule, UIManager, S.collect_task) end
-            S.hint_task = nil
-            S.collect_task = nil
             S.phase = "idle"
-            S.auto_firing = false
+            S.auto_firing = 0
             restore_autoturn(S.inst)
         end
+        S.collect_end = nil
+        S.hint_end = nil
+        S.suspended_phase = nil
+        S.suspend_snapshot = nil
         S.ready_fired = false
+        return
+    end
+
+    -- ③ 休眠：撤销补丁自己的两个定时任务，避免它们在锁屏期间冻结、唤醒后
+    -- 与 AutoTurn 原生 _start() 重排的 task 叠加。phase / collect_end / hint_end
+    -- 全部保留，交给 onResume 按剩余时长重建（或直接判定到点结算）。
+    if handler == "onSuspend" then
+        if S.phase == "collecting" or S.phase == "pending" then
+            S.suspended_phase = S.phase
+            clear_timers()
+            S.last_turn_ts = nil   -- 跨休眠的间隔不是有效阅读节奏
+            S.burst = 0
+            logger.info("aat: suspend, timers cleared phase=", S.phase)
+        end
+        return
+    end
+
+    -- ③ 唤醒：按 collect_end / hint_end 的剩余时长重建定时任务。
+    -- 剩余由「含休眠的墙上单调时钟」算出，锁屏多久都会如实扣减，到点即结算。
+    if handler == "onResume" then
+        if S.suspended_phase == "collecting" and S.phase == "collecting" then
+            arm_collect_task()   -- 内部按 collect_end 复核；到点直接 finish("timeout")
+            logger.info("aat: resume, collect timer rebuilt")
+        elseif S.suspended_phase == "pending" and S.phase == "pending" then
+            local now = now_s() or 0
+            local remain = (S.hint_end or now) - now
+            if remain <= 0 then
+                begin_collecting()
+            else
+                clear_timers()
+                S.hint_task = function() begin_collecting() end
+                pcall(UIManager.scheduleIn, UIManager, remain, S.hint_task)
+            end
+            logger.info("aat: resume, hint timer rebuilt remain=", remain)
+        end
+        S.suspended_phase = nil
+        S.last_turn_ts = nil
+        S.burst = 0
         return
     end
 
@@ -975,9 +1123,9 @@ local function on_event_after(this, handler, args)
 
     if handler == "onPageUpdate" and type(args) == "table" then
         local new_page = args[1]
-        -- A3：自动翻页产生的 PageUpdate 由 wrap_schedule 的 auto_firing 识别，
+        -- A3：自动翻页产生的 PageUpdate 由 wrap_schedule 的 auto_firing 计数识别，
         -- 不入样本池；并防自激（用户若训练期手动开了 Autoturn，重新挂起）。
-        if S.auto_firing then
+        if S.auto_firing > 0 then
             if S.phase == "collecting" and S.inst and is_enabled(S.inst) then
                 logger.warn("aat: autoturn re-enabled during collection, suspending again")
                 S.inst.enabled = false
@@ -995,14 +1143,18 @@ end
 
 -- 辅 hook：包裹 AutoTurn._schedule，在它发出 GotoViewRel 的窗口内置
 -- auto_firing，用于把自动翻页与手动翻页区分开（A3）。
+-- 用计数而非布尔：_schedule 内部会同步 handleEvent(GotoViewRel)，期间可能
+-- 再次重入 _schedule（菜单打断、嵌套调度）。布尔会被内层提前清掉，导致外层
+-- 后半段的自动翻页被误判成手动翻页；计数保证整个嵌套窗口都被识别。
 local function wrap_schedule(inst)
     if not S.probe._schedule then return end
     S.had_own_schedule = (rawget(inst, "_schedule") ~= nil)
     S.orig_schedule = inst._schedule
     inst._schedule = function(this, ...)
-        S.auto_firing = true
+        S.auto_firing = S.auto_firing + 1
         local ok, r1, r2, r3 = pcall(S.orig_schedule, this, ...)
-        S.auto_firing = false
+        S.auto_firing = S.auto_firing - 1
+        if S.auto_firing < 0 then S.auto_firing = 0 end
         if not ok then
             logger.warn("aat: wrapped _schedule error:", tostring(r1))
             return nil
@@ -1086,6 +1238,13 @@ end
 
 local function detach_hooks()
     local inst, ui = S.inst, S.ui
+    -- ⑥ 换书 detach 时无条件撤销两个定时句柄并复位采集态，杜绝幽灵任务。
+    clear_timers()
+    S.collect_end = nil
+    S.hint_end = nil
+    S.suspended_phase = nil
+    S.auto_firing = 0
+    S.phase = "idle"
     if ui and S.orig_handleEvent then
         if S.had_own_handleEvent then ui.handleEvent = S.orig_handleEvent
         else ui.handleEvent = nil end

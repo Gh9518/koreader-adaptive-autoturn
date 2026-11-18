@@ -73,9 +73,10 @@ AutoTurn 要求你填一个秒数。这个数字只能靠猜，而且怎么猜�
 
 休眠唤醒是所有定时类补丁最难处理的场景，补丁在这部分刻意保守：
 
-- **电源标志交回原生。** 补丁不直接写 `PluginShare.pause_auto_suspend`。开启走 AutoTurn 原生 `_start()`，挂起/取消走 `_unschedule()`，标志始终成对，设备可以正常自动待机。
-- **两套时钟，一个权威截止时刻。** KOReader 的 `scheduleIn` 基于 `CLOCK_MONOTONIC`，休眠期间不走。因此补丁以「含休眠的墙上单调时钟」`UIManager:getElapsedTimeSinceBoot()` 算出的截止时刻为准，判断页面提示与 30 分钟兜底超时；定时任务只作为「到点叫醒复核」的触发器。锁屏再久也不会把 30 分钟拖成 57 分钟。
-- **挂起即撤销定时。** `onSuspend` 时撤销补丁全部定时任务并清空翻页计时基准；`onResume` 时按剩余时长幂等重建（不依赖挂起事件的记账，事件丢失也有兜底），若截止时刻已过则直接结算。跨休眠的间隔绝不会被计入样本。
+- **电源标志全程成对，锁屏不再被卡住。** 补丁不直接写 `PluginShare.pause_auto_suspend`。开启走 AutoTurn 原生 `_start()`（置 true），停止走 `_unschedule()`（清 false）。关键在 `onSuspend` 时补丁会**主动调用原生 `_unschedule()`**，而不依赖 AutoTurn 自己的 `onSuspend` 处理器——AutoTurn 通过 `event_hook("InputEvent")` 注册，广播的 `Suspend` 事件在某些版本/插件组合下未必送达它，标志就会卡在 true，导致设备一直无法锁屏、停止自动翻页后超过设定时间也不自动待机。这次主动调用与原生调用幂等。
+- **唤醒时恢复自动翻页。** 若锁屏前自动翻页处于开启状态，补丁在挂起时记下它；`onResume` 时用原生 `_start()` 恢复，让待机标志与翻页任务一起重建。采集/等待阶段则刻意保持自动翻页挂起，唤醒不会在训练中途重启翻页。
+- **两套时钟，一个权威截止时刻。** KOReader 的 `scheduleIn` 基于 `CLOCK_MONOTONIC`，休眠期间不走。因此补丁以「含休眠的墙上单调时钟」`UIManager:getElapsedTimeSinceBoot()` 算出的截止时刻为准，判断页面提示与 30 分钟兜底超时；定时任务只作为「到点叫醒复核」的触发器。锁屏超过 30 分钟会在唤醒时立即结算，不会拖成一小时，跨休眠的间隔也不会计入样本。
+- **采集期能正常锁屏。** 采集期间 `pause_auto_suspend` 为 false，设备可以照常锁屏；`onSuspend` 撤销补丁定时并清空计时基准，`onResume` 按剩余时长幂等重建（不依赖挂起事件的记账，事件丢失也有兜底），若截止时刻已过则立即结算退出。跨休眠的间隔绝不会被计入样本。
 - **不留幽灵任务。** 开新书、关文档、换书、中止、结算、休眠，都会无条件清理全部定时任务句柄。
 - **可重入。** AutoTurn 的 `_schedule()` 会同步派发翻页并重新进入事件处理（例如自动翻页被菜单打断）。补丁用计数而非布尔标记这段窗口，嵌套调度不会把自动翻页误判成手动样本。
 - **内存随书释放。** 关书时还原全部 hook 并释放对 ReaderUI 实例的引用，关闭的书（含其渲染文档）不会在浏览文件管理器期间被补丁钉在内存里。事件包装避免逐事件分配，页面事件只在采集期处理——日常翻页状态下补丁零开销。
@@ -88,8 +89,9 @@ AutoTurn 要求你填一个秒数。这个数字只能靠猜，而且怎么猜�
 
 | 日志行 | 含义 |
 | --- | --- |
-| `aat: suspend received phase=...` | 补丁已收到系统挂起事件 |
+| `aat: suspend received phase=...` | 补丁已收到系统挂起事件，并主动停止自动翻页、清除电源标志 |
 | `aat: resume received phase=...` | 补丁已收到唤醒事件 |
+| `aat: resume, autoturn restored via native _start` | 锁屏前自动翻页开着，唤醒后已通过原生 `_start` 恢复（标志重建） |
 | `aat: hooks installed / hooks detached` | 开书挂载 hook / 关书还原 hook |
 | `aat: autoturn enabled via native _start sec=...` | 自动翻页已按该间隔开启 |
 | `aat: collection done reason=enough/timeout ... learned=...` | 采集完成并写入学习值 |

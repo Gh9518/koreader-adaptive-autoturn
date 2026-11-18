@@ -29,8 +29,9 @@
   * 触发 = 「用户开启自动翻页」：开书时不打扰用户，补丁只静默挂好 hook；
     当用户从菜单把 Autoturn 由「关→开」时（wrap_menu /
     wrap_switch_methods 拦截）才弹出间隔选择框：
-      使用已有数据 / 重新训练 / 手动设置 / 取消
-    「开→关」直接放行原逻辑。取消 = 不开启，保持关闭。
+      当前间隔：X 秒/页（有数据时）/ 重新训练 / 手动设置 / 取消
+    「开→关」直接关闭（跳过原生「设置时间/禁用」选择框，清待机标志）。
+    取消 = 不开启，保持关闭。
   * 自适应学习（重新训练）：选「重新训练」即进入流程。先弹一个页面提示，
     默认 hint_timeout(3) 秒自动关闭；提示关闭后才正式开始分析采集
     （pending→collecting），刚点完按钮、提示还在时的翻页不会计入样本。
@@ -221,6 +222,7 @@ local CFG = {
 
     LANG = {
         use_learned = "使用已有数据",
+        current     = "当前间隔：%d 秒/页",
         manual      = "手动设置",
         retrain     = "重新训练",
         cancel      = "取消",
@@ -498,15 +500,11 @@ local function probe_all(inst, ui)
         if type(inst[name]) == "function" then p.switch_disable = name; break end
     end
     S.probe = p
-    logger.info("aat: probe",
-        "autoturn_sec=", tostring(p.autoturn_sec),
-        "enabled=", tostring(p.enabled),
-        "_schedule=", tostring(p._schedule),
-        "addToMainMenu=", tostring(p.addToMainMenu),
-        "handleEvent=", tostring(p.handleEvent),
-        "paging/rolling=", tostring(p.paging), "/", tostring(p.rolling),
-        "switch(enable/disable)=", tostring(p.switch_enable), "/", tostring(p.switch_disable),
-        "InputDialog=", tostring(p.InputDialog))
+    logger.info(string.format(
+        "aat: probe sec=%d en=%d sch=%d menu=%d view=%d/%d sw=%d/%d input=%d",
+        p.autoturn_sec and 1 or 0, p.enabled and 1 or 0, p._schedule and 1 or 0,
+        p.addToMainMenu and 1 or 0, p.paging and 1 or 0, p.rolling and 1 or 0,
+        p.switch_enable and 1 or 0, p.switch_disable and 1 or 0, p.InputDialog and 1 or 0))
     return p
 end
 
@@ -609,7 +607,31 @@ local function suspend_autoturn(inst)
     inst.autoturn_sec = CFG.suspend_sec
     inst.onResume = nil
     call_unschedule(inst)
-    logger.info("aat: autoturn suspended (switch=", tostring(used), ")")
+    logger.info(string.format("aat: autoturn suspended switch=%s", tostring(used)))
+end
+
+-- 用户手动停止自动翻页：跳过原生的「设置时间/禁用」选择框，直接执行原生
+-- 禁用分支的全部副作用（与 AutoTurn cancel_callback 对齐）：enabled=false、
+-- makeFalse("autoturn_enabled")、_unschedule() 清待机标志、摘掉 onResume，
+-- 并让补丁进入休眠。全部 pcall 包裹，任一步失败都不阻断关闭。
+local function disable_autoturn(inst)
+    if not inst then return end
+    inst.enabled = false
+    pcall(function()
+        if G_reader_settings and type(G_reader_settings.makeFalse) == "function" then
+            G_reader_settings:makeFalse("autoturn_enabled")
+        elseif G_reader_settings and type(G_reader_settings.saveSetting) == "function" then
+            G_reader_settings:saveSetting("autoturn_enabled", false)
+        end
+        if G_reader_settings and type(G_reader_settings.flush) == "function" then
+            G_reader_settings:flush()
+        end
+    end)
+    inst.onResume = nil
+    -- _unschedule 内置 pause_auto_suspend=false，清掉待机标志，设备可正常锁屏。
+    call_unschedule(inst)
+    enter_dormant()
+    logger.info("aat: autoturn disabled (native dialog skipped)")
 end
 
 -- 开启：把 AutoTurn 原生菜单 callback 的副作用补齐，再交回原生 _start()
@@ -662,7 +684,7 @@ local function resume_autoturn(inst, sec)
         pcall(function() inst.last_action_time = now_raw() or 0 end)
         if S.probe._schedule then pcall(inst._schedule, inst) end
     end
-    logger.info("aat: autoturn enabled via native _start sec=", sec)
+    logger.info(string.format("aat: autoturn enabled sec=%s", tostring(sec)))
 end
 
 -- 仅还原挂起前的实例态，不动 G_reader_settings（不改其它模块持久状态）。
@@ -684,10 +706,10 @@ end
 local function refresh_conf()
     S.conf = read_learned()
     if S.conf == nil then
-        logger.info("aat: no valid learned value (treated as empty)")
+        logger.info("aat: learned none")
     else
-        logger.info("aat: global learned_sec=", tostring(S.conf.learned_sec),
-            "trained=", tostring(S.conf.trained))
+        logger.info(string.format("aat: learned %ss trained=%s",
+            tostring(S.conf.learned_sec), tostring(S.conf.trained)))
     end
 end
 
@@ -794,7 +816,7 @@ start_collection = function()
     show_info(string.format(
         L("即将开始采集：采够 %d 个翻页间隔会自动结束（最长 %d 分钟）。本提示 %d 秒后自动关闭，之后开始分析采集；期间自动翻页已关闭，请正常手动翻页。"),
         CFG.target_samples, CFG.train_timeout_min, CFG.hint_timeout))
-    logger.info("aat: page hint shown, collecting starts in ", CFG.hint_timeout, "s")
+    logger.info(string.format("aat: page hint shown, collect in %ss", tostring(CFG.hint_timeout)))
 
     -- 只用一个任务句柄驱动「提示关闭 → 开始采集」，切书/中止/休眠时可 unschedule。
     clear_timers()
@@ -839,8 +861,8 @@ begin_collecting = function()
     S.collect_end = (now_s() or 0) + CFG.train_timeout_min * 60
     S.auto_firing = 0
     S.suspended_phase = nil
-    logger.info("aat: page hint closed, collection started, target=",
-        CFG.target_samples, "timeout_min=", CFG.train_timeout_min)
+    logger.info(string.format("aat: hint closed, collection started target=%d timeout=%dmin",
+        CFG.target_samples, CFG.train_timeout_min))
     arm_collect_task()
 end
 
@@ -852,7 +874,7 @@ end
 show_dialog_enable = function()
     local learned = has_learned(S.conf) and S.conf.learned_sec or nil
     local label = learned
-        and string.format(L(CFG.LANG.use_learned) .. "（%d 秒/页）", learned)
+        and string.format(L(CFG.LANG.current), learned)
         or L(CFG.LANG.use_learned)
     show_buttons(L(CFG.LANG.b_title), L(CFG.LANG.b_body), {
         {
@@ -1038,7 +1060,7 @@ on_page_changed = function(new_page, ts_mono)
     -- 本次翻页起算，不会因为丢弃这个样本而把后续节奏算歪。
     if gap < CFG.abs_min_keep then
         S.burst = 0
-        logger.info("aat: too-small interval dropped ", string.format("%.2f", gap))
+        logger.info(string.format("aat: too-small interval dropped %.1f", gap))
         return
     end
     -- B2 dt > 300：丢弃并重置。
@@ -1050,8 +1072,8 @@ on_page_changed = function(new_page, ts_mono)
     -- B3 入池
     S.burst = 0
     S.samples[#S.samples + 1] = { v = gap, t = ts_mono }
-    logger.info("aat: sample ", string.format("%.2f", gap),
-        " (", #S.samples, "/", CFG.target_samples, ")")
+    logger.info(string.format("aat: sample %.1f (%d/%d)",
+        gap, #S.samples, CFG.target_samples))
     -- 主结束条件：采够足够数据量即结算；兜底超时由 finish_collection 撤销。
     if #S.samples >= CFG.target_samples then finish_collection("enough") end
 end
@@ -1068,8 +1090,8 @@ finish_collection = function(reason)
         -- apply_value 内部也已 enter_dormant（幂等）；日志样本数用提前保存的 n。
         apply_value(learned, true,
             string.format(L("学习完成，自动翻页间隔已设为 %d 秒"), learned))
-        logger.info("aat: collection done reason=", tostring(reason),
-            "samples=", n, "learned=", learned)
+        logger.info(string.format("aat: collection done reason= %s samples=%d learned=%s",
+            tostring(reason), n, tostring(learned)))
     else
         -- 采集失败（超时未采够或异常值过多被剔光）：不改全局值，用 default_sec
         -- 开启并提示可重试；重试直接重新采集。
@@ -1082,8 +1104,8 @@ finish_collection = function(reason)
                             L(CFG.LANG.cancel), nil) then
             show_info(msg, 6)
         end
-        logger.warn("aat: collection failed reason=", tostring(reason),
-            "why=", tostring(why), "samples=", n, "fallback=", fb)
+        logger.warn(string.format("aat: collection failed reason= %s why=%s samples=%d fallback=%d",
+            tostring(reason), tostring(why), n, fb))
     end
 end
 
@@ -1150,7 +1172,7 @@ local function on_event_after(this, handler, args)
     -- 无论 idle 还是采集期都打一行日志：真机排查挂起卡死时，日志里能看到
     -- 补丁确实收到并处理了挂起事件（此前 idle 静默，无法确认事件送达）。
     if handler == "onSuspend" then
-        logger.info("aat: suspend received phase=", S.phase)
+        logger.info(string.format("aat: suspend received phase= %s", S.phase))
         -- 主动停止 AutoTurn 原生翻页调度：_unschedule() 无条件清
         -- pause_auto_suspend=false 并撤销 task，保证设备能真正进入 suspend。
         -- 不依赖 AutoTurn 原生 onSuspend 被 broadcast 触发——AutoTurn 通过
@@ -1178,7 +1200,7 @@ local function on_event_after(this, handler, args)
     -- 按 S.phase 幂等处理，不依赖 suspended_phase 记账：即便挂起事件因任何
     -- 原因未送达（事件丢失兜底），唤醒时也照样能重排定时并复核到点。
     if handler == "onResume" then
-        logger.info("aat: resume received phase=", S.phase)
+        logger.info(string.format("aat: resume received phase= %s", S.phase))
         if S.phase == "collecting" then
             -- arm_collect_task 内部先撤旧任务再按 collect_end 复核：
             -- 未到点重排、到点直接 finish("timeout")，重复调用幂等。
@@ -1206,7 +1228,7 @@ local function on_event_after(this, handler, args)
                 S.hint_task = function() begin_collecting() end
                 pcall(UIManager.scheduleIn, UIManager, remain, S.hint_task)
             end
-            logger.info("aat: resume, hint timer re-armed remain=", remain)
+            logger.info(string.format("aat: resume, hint timer re-armed remain=%s", tostring(remain)))
         end
         S.suspended_phase = nil
         S.suspend_autoturn_was_on = false
@@ -1289,8 +1311,13 @@ local function wrap_menu(inst)
             local orig_cb = item.callback
             item.callback = function(menu)
                 if is_enabled(this) then
-                    -- 已开启 → 用户可能要改时长/关闭，直接放行原逻辑
-                    return orig_cb(menu)
+                    -- 已开启 → 用户点菜单要关闭：跳过原生「设置时间/禁用」选择框，
+                    -- 直接执行原生禁用的全部副作用（含待机标志清位）。
+                    disable_autoturn(this)
+                    if type(menu) == "table" and type(menu.updateItems) == "function" then
+                        pcall(menu.updateItems, menu)
+                    end
+                    return true
                 end
                 -- pending / collecting 期间不重复弹窗 B。
                 if S.phase == "pending" or S.phase == "collecting" then
@@ -1334,7 +1361,7 @@ local function wrap_switch_methods(inst)
     inst[name] = function(this, ...)
         -- pending（页面提示中）/ collecting（采集中）都不重复弹窗 B。
         if not is_enabled(this) and S.phase ~= "collecting" and S.phase ~= "pending" then
-            logger.info("aat: intercepted switch ", name, " -> dialog B")
+            logger.info(string.format("aat: intercepted switch %s -> dialog B", name))
             show_dialog_enable()
             return true
         end

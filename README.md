@@ -75,9 +75,24 @@ Sleep/wake cycles are the hardest case for any timer-driven patch, so this part 
 
 - **The power flag belongs to AutoTurn.** The patch never sets `PluginShare.pause_auto_suspend` itself. Enabling goes through AutoTurn's native `_start()`, and suspending or cancelling through `_unschedule()`, so the flag is always balanced and the device keeps its normal auto-suspend behaviour.
 - **Two clocks, one authoritative deadline.** KOReader's `scheduleIn` uses `CLOCK_MONOTONIC`, which does not tick while the device sleeps. The patch therefore treats a wall-clock monotonic deadline from `UIManager:getElapsedTimeSinceBoot()` as authoritative for both the page hint and the 30-minute safety timeout; the scheduled tasks are only "wake me up and re-check" triggers. A long lock-screen session cannot stretch the 30-minute timeout into an hour.
-- **Timers are cancelled on suspend.** On `onSuspend` both scheduled tasks are unscheduled and the page-turn timing baseline is cleared. On `onResume` they are rebuilt from the remaining time, or collection is settled immediately if the deadline has already passed. Gaps that span a sleep are never counted as reading samples.
-- **No orphan timers.** Opening a book, closing a document, switching books, aborting, settling and suspending all clear both task handles unconditionally.
+- **Timers are cancelled on suspend.** On `onSuspend` all of the patch's scheduled tasks are unscheduled and the page-turn timing baseline is cleared. On `onResume` they are rebuilt from the remaining time — idempotently, without relying on bookkeeping from the suspend event — or collection is settled immediately if the deadline has already passed. Gaps that span a sleep are never counted as reading samples.
+- **No orphan timers.** Opening a book, closing a document, switching books, aborting, settling and suspending all clear every task handle unconditionally.
 - **Re-entrancy safe.** AutoTurn's `_schedule()` can dispatch a page turn synchronously and re-enter the event handler — for example when a menu interrupts an auto-turn. The patch marks that window with a counter instead of a boolean, so nested scheduling cannot misclassify an auto-turn as a manual sample.
+- **Memory is released with the book.** Closing a document restores every hook and drops all references to the ReaderUI instance, so a closed book (including its rendered document) is never pinned in memory while you browse the file manager. The event wrapper avoids per-event allocations, and page events are only processed during collection — idle page turns cost the patch nothing.
+- **Suspend and wake are always observable.** Every suspend and resume event produces one `aat:` log line regardless of patch state, so device-side logs can confirm the events were actually received.
+
+### Diagnostic logs
+
+All patch messages use the `aat:` prefix. The most useful lines when investigating freezes around sleep/wake:
+
+| Log line | Meaning |
+| --- | --- |
+| `aat: suspend received phase=...` | The patch received the system suspend event |
+| `aat: resume received phase=...` | The patch received the resume event |
+| `aat: hooks installed / hooks detached` | Hooks (re)attached on book open / removed on book close |
+| `aat: autoturn enabled via native _start sec=...` | AutoTurn enabled with the given interval |
+| `aat: collection done reason=enough/timeout ... learned=...` | Training finished and the value was stored |
+| `aat: collection failed reason=...` | Not enough valid samples; fallback interval applied |
 
 ---
 

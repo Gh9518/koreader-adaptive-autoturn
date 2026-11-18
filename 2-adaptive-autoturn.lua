@@ -416,6 +416,7 @@ local S = {
     -- 休眠：挂起时撤销两个定时任务，唤醒时按剩余时长重建（避免休眠期任务与
     -- 原生 _start() 重排的 task 叠加，也避免单调时钟冻结导致倒计时被拖长）。
     suspended_phase = nil,  -- 挂起时正处于 pending / collecting
+    suspend_autoturn_was_on = false, -- 挂起前 Autoturn 是否开启（唤醒时在 idle 恢复）
 
     -- 防自激：计数而非布尔。_schedule 内会同步派发 GotoViewRel 再重入
     -- handleEvent，嵌套时布尔会被内层提前清掉；计数保证整段窗口都被识别。
@@ -1150,6 +1151,19 @@ local function on_event_after(this, handler, args)
     -- 补丁确实收到并处理了挂起事件（此前 idle 静默，无法确认事件送达）。
     if handler == "onSuspend" then
         logger.info("aat: suspend received phase=", S.phase)
+        -- 主动停止 AutoTurn 原生翻页调度：_unschedule() 无条件清
+        -- pause_auto_suspend=false 并撤销 task，保证设备能真正进入 suspend。
+        -- 不依赖 AutoTurn 原生 onSuspend 被 broadcast 触发——AutoTurn 通过
+        -- event_hook:registerWidget("InputEvent") 注册，某些版本/插件组合下
+        -- broadcast 的 Suspend 未必送达它，标志就会残留 true（表现为锁屏
+        -- 不动作、停止自动翻页后超时也不自动锁屏）。此处与原生调用幂等。
+        -- 采集期/等待期原本就把 Autoturn 挂起了（is_enabled=false），停它无害；
+        -- idle 且原本开启时也要停，唤醒后在 onResume 里按此快照恢复。
+        S.suspend_autoturn_was_on = false
+        if S.inst then
+            pcall(function() S.suspend_autoturn_was_on = is_enabled(S.inst) end)
+            call_unschedule(S.inst)
+        end
         if S.phase == "collecting" or S.phase == "pending" then
             S.suspended_phase = S.phase
             clear_timers()
@@ -1170,6 +1184,18 @@ local function on_event_after(this, handler, args)
             -- 未到点重排、到点直接 finish("timeout")，重复调用幂等。
             arm_collect_task()
             logger.info("aat: resume, collect timer re-armed")
+        elseif S.phase == "idle" then
+            -- idle 且锁屏前 Autoturn 开着：onSuspend 里补丁主动停了它并清了
+            -- 待机标志，这里用原生 _start() 恢复调度与标志的配对，避免唤醒后
+            -- 自动翻页静默失效或 pause_auto_suspend 悬空。采集/等待期不恢复
+            -- （那两个阶段本就刻意保持 Autoturn 挂起）。
+            -- 注意：_unschedule() 只撤 task、清待机标志，不改 enabled 字段，
+            -- 故唤醒时 enabled 仍为 true；这里据 was_on + 仍开启判定需重建。
+            if S.suspend_autoturn_was_on and S.inst and is_enabled(S.inst)
+               and S.probe._start then
+                pcall(S.inst._start, S.inst)
+                logger.info("aat: resume, autoturn restored via native _start")
+            end
         elseif S.phase == "pending" then
             local now = now_s() or 0
             local remain = (S.hint_end or now) - now
@@ -1183,6 +1209,7 @@ local function on_event_after(this, handler, args)
             logger.info("aat: resume, hint timer re-armed remain=", remain)
         end
         S.suspended_phase = nil
+        S.suspend_autoturn_was_on = false
         S.last_turn_ts = nil
         S.burst = 0
         return

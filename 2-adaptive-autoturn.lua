@@ -442,6 +442,26 @@ local function clear_timers()
     end
 end
 
+-- 深度休眠：一次学习/设置「用完」后，补丁不再需要任何采样状态。这里把样本、
+-- 计时基准、定时句柄、挂起快照全部释放，并把 phase 归为 idle。之后 handleEvent
+-- 入口会据 phase 走极简路径，让补丁在事件路径上的常驻开销降到一次布尔比较。
+-- 用.oneshot 语义：所有「结束使用」的分支都调用它，重复调用幂等。
+local function enter_dormant()
+    clear_timers()
+    S.phase = "idle"
+    S.samples = {}
+    S.last_page = nil
+    S.last_turn_ts = nil
+    S.last_sig_page = nil
+    S.last_sig_ts = nil
+    S.burst = 0
+    S.auto_firing = 0
+    S.collect_end = nil
+    S.hint_end = nil
+    S.suspended_phase = nil
+    S.suspend_snapshot = nil
+end
+
 -- ---------------------------------------------------------------- 探测 ------
 local SWITCH_ENABLE  = { "enable", "setEnabled", "toggle", "onEnable" }
 local SWITCH_DISABLE = { "disable", "setEnabled", "toggle", "onDisable" }
@@ -685,6 +705,8 @@ apply_value = function(sec, trained, msg)
     end
     refresh_conf()
     resume_autoturn(S.inst, sec)
+    -- 用完即退场：值已落盘、Autoturn 已按该值开启，补丁不再需要任何采样态。
+    enter_dormant()
     show_info(msg)
 end
 
@@ -692,6 +714,7 @@ end
 action_use_learned = function()
     local sec = has_learned(S.conf) and S.conf.learned_sec or CFG.default_sec
     resume_autoturn(S.inst, sec)
+    enter_dormant()
     show_info(string.format(L("已使用已有数据，自动翻页间隔 %d 秒。"), sec))
     logger.info("aat: use learned sec=", sec)
 end
@@ -702,6 +725,7 @@ action_cancel_enable = function()
         S.inst.enabled = false
         call_unschedule(S.inst)
     end
+    enter_dormant()
     logger.info("aat: enable cancelled, autoturn stays off")
 end
 
@@ -711,14 +735,11 @@ abort_collection = function(msg)
         clear_timers()
         S.phase = "idle"
         S.auto_firing = 0
-        restore_autoturn(S.inst)
+        restore_autoturn(S.inst)  -- 先读快照还原，再让 enter_dormant 清掉它
     else
         clear_timers()  -- 即便 idle 也清，杜绝任何残留句柄
     end
-    S.collect_end = nil
-    S.hint_end = nil
-    S.suspended_phase = nil
-    S.suspend_snapshot = nil
+    enter_dormant()  -- 中止即退场：释放样本与全部运行时态
     show_info(msg, 6)
 end
 
@@ -925,6 +946,21 @@ local RESET_HANDLERS = {
     onGotoLocation = true, onBookmarkGoTo = true,
 }
 
+-- 休眠态（phase == idle）唯一还需要过问的事件。日常翻页 PageUpdate、重排类
+-- RESET_HANDLERS、以及其它一切高频事件在 handleEvent 入口直接短路，连一次
+-- pcall 都不做——这是「用完就退出」在事件路径上的落点。
+-- 保留这四类是因为它们低频且不可省：
+--   onReaderReady   换书后重新武装（清状态、刷新全局值）
+--   onCloseDocument 关书释放内存（v8 泄漏修复，必须保留）
+--   onSuspend       挂起可观测日志 + 清计时基准
+--   onResume        唤醒可观测日志 + 幂等兜底
+-- 注意：弹窗 B 的「启用自动翻页」唤醒走 addToMainMenu / switch 方法包装，
+-- 不经过 handleEvent，所以休眠不影响「启用自动翻页才唤醒进行判断」。
+local DORMANT_HANDLERS = {
+    onReaderReady = true, onCloseDocument = true,
+    onSuspend = true, onResume = true,
+}
+
 -- 每次页面变更后统一处理：非采集期只做去重维护；采集期才决定是否把间隔入池。
 -- 本补丁只维护运行时采样状态，不产生任何翻页日志。
 on_page_changed = function(new_page, ts_mono)
@@ -1022,20 +1058,17 @@ end
 -- ---------------------------------------------------------------- 结束 ------
 finish_collection = function(reason)
     if S.phase ~= "collecting" then return end
-    S.phase = "idle"
-    -- 无条件撤销两个定时句柄；结算后不留任何幽灵任务（⑥）。
-    clear_timers()
-    S.collect_end = nil
-    S.hint_end = nil
-    S.suspended_phase = nil
-    S.auto_firing = 0
-
+    local n = #S.samples
+    -- 先在仍持有时算出学习值，再统一进入休眠（清样本与全部运行时态）。
     local learned, why = compute_learned(S.samples)
+    enter_dormant()
+
     if learned then
+        -- apply_value 内部也已 enter_dormant（幂等）；日志样本数用提前保存的 n。
         apply_value(learned, true,
             string.format(L("学习完成，自动翻页间隔已设为 %d 秒"), learned))
         logger.info("aat: collection done reason=", tostring(reason),
-            "samples=", #S.samples, "learned=", learned)
+            "samples=", n, "learned=", learned)
     else
         -- 采集失败（超时未采够或异常值过多被剔光）：不改全局值，用 default_sec
         -- 开启并提示可重试；重试直接重新采集。
@@ -1049,9 +1082,8 @@ finish_collection = function(reason)
             show_info(msg, 6)
         end
         logger.warn("aat: collection failed reason=", tostring(reason),
-            "why=", tostring(why), "samples=", #S.samples, "fallback=", fb)
+            "why=", tostring(why), "samples=", n, "fallback=", fb)
     end
-    S.suspend_snapshot = nil
 end
 
 -- ---------------------------------------------------------------- Hook ------
@@ -1329,11 +1361,17 @@ local function ensure_hooks(inst, ui)
     ui.handleEvent = function(this, event, ...)
         local r1, r2, r3 = S.orig_handleEvent(this, event, ...)
         -- 原逻辑优先；补丁观察逻辑出错绝不影响主流程。
-        -- 直接以函数引用调 pcall、不新建闭包：ReaderUI.handleEvent 是全系统
-        -- 广播与输入事件的总入口（挂起/唤醒/翻页/配置刷新都经过这里），
-        -- 每个事件省掉一次闭包分配，长期运行对低内存设备更友好。
         if type(event) == "table" then
-            pcall(on_event_after, this, event.handler, event.args)
+            local handler = event.handler
+            -- 深度休眠：学习/设置完成（或尚未开始）后 phase==idle，此时只有
+            -- 低频生命周期事件才值得过问；日常翻页/重排等高频事件连 pcall
+            -- 都不进，把常驻事件开销压到一次布尔比较 + 一次表查询。
+            -- 采集期（pending/collecting）不受此路径影响，照常全量处理。
+            if S.phase ~= "idle" or DORMANT_HANDLERS[handler] then
+                -- 直接以函数引用调 pcall、不新建闭包：ReaderUI.handleEvent 是
+                -- 全系统广播与输入事件的总入口，省掉闭包分配对低内存更友好。
+                pcall(on_event_after, this, handler, event.args)
+            end
         end
         return r1, r2, r3
     end

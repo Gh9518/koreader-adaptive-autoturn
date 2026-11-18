@@ -89,9 +89,17 @@
     用纯 CLOCK_MONOTONIC（休眠期间不走），KOReader 唤醒时会平移任务队列，
     因此补丁的两个定时任务只是「到点叫醒复核」的触发器，是否真正到点一律
     用 collect_end / hint_end 判定，锁屏再久也不会把 30 分钟拖成 57 分钟。
-    onSuspend 撤销两个任务、onResume 按剩余时长重建，且不与 AutoTurn 原生
-    _start() 重排的 task 叠加。AutoTurn.last_action_time 的比较发生在 fts 域，
-    回填时保留原始值。本补丁不写任何文件。
+    onSuspend 撤销补丁全部定时任务、onResume 按 S.phase 幂等重建（不依赖
+    挂起时的记账，挂起事件万一丢失也能兜底），且不与 AutoTurn 原生 _start()
+    重排的 task 叠加；挂起与唤醒无论 idle 还是采集期都各打一行日志，真机
+    排查时可据此确认事件确实送达补丁。AutoTurn.last_action_time 的比较发生
+    在 fts 域，回填时保留原始值。本补丁不写任何文件。
+  * 内存：关书（onCloseDocument）即还原全部 hook 并释放 S.ui / S.inst /
+    S.samples / S.probe / S.conf，不把销毁后的 ReaderUI（含 mupdf 文档）
+    钉在内存里导致文件管理器期间无法回收；handleEvent 包装以函数引用直调
+    pcall、不新建闭包；页面事件只在采集期处理，idle 翻页零分配、零时钟
+    调用。补丁自排的全部定时任务（含非法输入后的延迟重开输入框）都登记
+    句柄并随 clear_timers 一并撤销，重开任务体校验关书后不再弹窗。
   * ButtonDialog 的按钮回调不会自动关闭（buttontable.lua:80-85 只调
     btn_entry.callback），必须显式 UIManager:close(dlg)；ConfirmBox 才会自动关。
     ButtonTable 支持 enabled=false 置灰按钮（button.lua:485）。InputDialog
@@ -135,8 +143,12 @@
   * 唯一持久状态是 G_reader_settings.adaptive_autoturn；不创建目录、不写文件、
     不依赖 lfs、不改 Autoturn 源文件。开启时另由 AutoTurn 原生 _start() 维护
     它自己的 autoturn_enabled / autoturn_timeout_seconds 与 PluginShare 标志。
-  * 定时器生命周期：clear_timers() 统一撤销 hint_task / collect_task；开新书、
-    关文档、换书 detach、结算、中止、休眠都无条件调用，杜绝幽灵任务。
+  * 定时器生命周期：clear_timers() 统一撤销 hint_task / collect_task /
+    manual_retry_task；开新书、关文档、换书 detach、结算、中止、休眠都
+    无条件调用，杜绝幽灵任务。
+  * 内存与热路径：关书即释放全部实例/文档引用；handleEvent 包装不新建
+    闭包；页面事件仅在采集期处理，日常阅读状态下补丁在事件路径上的开销
+    趋近于零。
   * 防自激 auto_firing 用计数：_schedule 内同步派发 GotoViewRel 会重入
     handleEvent，菜单打断 / 嵌套调度时布尔会被内层提前清掉，计数保证整段
     窗口都被识别为自动翻页，不会误计入手动样本。
@@ -398,6 +410,7 @@ local S = {
     collect_task = nil,     -- 兜底超时倒计时任务句柄（采够样本会提前撤销）
     hint_task   = nil,      -- 「页面提示」自动关闭后启动采集的任务句柄
     hint_end    = nil,      -- 页面提示截止时刻（休眠唤醒后按剩余重建 hint_task）
+    manual_retry_task = nil, -- 手动设置非法输入后延迟重开输入框的任务句柄
     suspend_snapshot = nil,
 
     -- 休眠：挂起时撤销两个定时任务，唤醒时按剩余时长重建（避免休眠期任务与
@@ -410,8 +423,10 @@ local S = {
     probe       = {},
 }
 
--- 统一撤销补丁自己排定的两个定时任务。换书、关文档、休眠、结算、中止都要
+-- 统一撤销补丁自己排定的全部定时任务。换书、关文档、休眠、结算、中止都要
 -- 无条件调用，杜绝幽灵任务泄漏到下一本书或下一轮唤醒。
+-- UIManager:unschedule(action) 按 action 函数匹配队列项（uimanager.lua:518），
+-- 因此这里传的就是当初 scheduleIn 的那个闭包函数本身。
 local function clear_timers()
     if S.hint_task then
         pcall(UIManager.unschedule, UIManager, S.hint_task)
@@ -420,6 +435,10 @@ local function clear_timers()
     if S.collect_task then
         pcall(UIManager.unschedule, UIManager, S.collect_task)
         S.collect_task = nil
+    end
+    if S.manual_retry_task then
+        pcall(UIManager.unschedule, UIManager, S.manual_retry_task)
+        S.manual_retry_task = nil
     end
 end
 
@@ -546,6 +565,7 @@ end
 
 -- 优先调用探测到的关闭接口；无论成功与否，字段级挂起都兜底执行。
 local function suspend_autoturn(inst)
+    if not inst then return end  -- 关书后 S.inst 已释放，防御空引用
     local used = nil
     local name = S.probe.switch_disable
     if name then
@@ -576,6 +596,7 @@ end
 -- 它由 _start()(true) / _unschedule()(false) 成对维护；补丁单边只置 true，
 -- 设备会一直无法自动待机，并与电源管理 / 其他插件争用（锁屏唤醒卡死根因）。
 local function resume_autoturn(inst, sec)
+    if not inst then return end  -- 关书后 S.inst 已释放，防御空引用
     sec = math.floor(clamp(sec, CFG.min_sec, CFG.max_sec) + 0.5)
 
     -- 兼容分支：老版本探测到的开关方法，之后再字段级二次钉死。
@@ -654,7 +675,7 @@ end
 local on_page_changed, finish_collection, abort_collection,
       start_collection, begin_collecting, arm_collect_task, show_manual_dialog,
       show_dialog_enable,
-      action_use_learned, action_cancel_enable, apply_value
+      action_use_learned, action_cancel_enable, apply_value, detach_hooks
 
 -- 落地：写学习值到 G_reader_settings + 开启 + 提示。持久化失败只记日志，
 -- 运行时仍按该值开启。兜底超时固定为 train_timeout_min 分钟。
@@ -859,9 +880,14 @@ show_manual_dialog = function(from_enable, initial_val)
                         if not v or v ~= math.floor(v) or v < CFG.min_sec or v > CFG.max_sec then
                             show_info(L("输入无效，请输入 3~120 的整数。"))
                             -- 短延迟后重开，避免弹窗叠加；带上一次输入便于修改。
-                            pcall(UIManager.scheduleIn, UIManager, 0.3, function()
+                            -- 任务句柄登记进 S，随 clear_timers 一并撤销；任务体
+                            -- 校验 S.ui，关书后不弹幽灵输入框。
+                            S.manual_retry_task = function()
+                                S.manual_retry_task = nil
+                                if not S.ui then return end
                                 show_manual_dialog(from_enable, raw)
-                            end)
+                            end
+                            pcall(UIManager.scheduleIn, UIManager, 0.3, S.manual_retry_task)
                             return
                         end
                         apply_value(v, true,
@@ -1058,7 +1084,7 @@ local function on_event_after(this, handler, args)
     end
 
     if handler == "onCloseDocument" then
-        -- ⑥ 书籍关闭：无条件撤销两个定时句柄并清空状态，无论当前 phase，
+        -- ⑥ 书籍关闭：无条件撤销全部定时句柄并清空状态，无论当前 phase，
         -- 避免残留任务 / 标志串到下一本书。暂停电源标志由 AutoTurn 原生
         -- onCloseDocument→_unschedule 负责，本补丁不插手。
         clear_timers()
@@ -1067,6 +1093,16 @@ local function on_event_after(this, handler, args)
             S.auto_firing = 0
             restore_autoturn(S.inst)
         end
+        -- 内存释放：关书后 ReaderUI 与它持有的 mupdf 文档（可达数十 MiB）由
+        -- KOReader 销毁，补丁必须同步松手——还原 handleEvent 等全部 hook，
+        -- 并清掉 S.ui / S.inst / S.samples / S.probe / S.conf，否则文件管理器
+        -- 停留期间整个死掉的 ReaderUI 实例树会被补丁引用钉住、无法 GC
+        -- （低内存设备上表现为可用内存持续偏低）。
+        detach_hooks()
+        S.inst, S.ui = nil, nil
+        S.samples = {}
+        S.probe = {}
+        S.conf = nil
         S.collect_end = nil
         S.hint_end = nil
         S.suspended_phase = nil
@@ -1075,27 +1111,34 @@ local function on_event_after(this, handler, args)
         return
     end
 
-    -- ③ 休眠：撤销补丁自己的两个定时任务，避免它们在锁屏期间冻结、唤醒后
+    -- ③ 休眠：撤销补丁自己的全部定时任务，避免它们在锁屏期间冻结、唤醒后
     -- 与 AutoTurn 原生 _start() 重排的 task 叠加。phase / collect_end / hint_end
     -- 全部保留，交给 onResume 按剩余时长重建（或直接判定到点结算）。
+    -- 无论 idle 还是采集期都打一行日志：真机排查挂起卡死时，日志里能看到
+    -- 补丁确实收到并处理了挂起事件（此前 idle 静默，无法确认事件送达）。
     if handler == "onSuspend" then
+        logger.info("aat: suspend received phase=", S.phase)
         if S.phase == "collecting" or S.phase == "pending" then
             S.suspended_phase = S.phase
             clear_timers()
             S.last_turn_ts = nil   -- 跨休眠的间隔不是有效阅读节奏
             S.burst = 0
-            logger.info("aat: suspend, timers cleared phase=", S.phase)
         end
         return
     end
 
     -- ③ 唤醒：按 collect_end / hint_end 的剩余时长重建定时任务。
     -- 剩余由「含休眠的墙上单调时钟」算出，锁屏多久都会如实扣减，到点即结算。
+    -- 按 S.phase 幂等处理，不依赖 suspended_phase 记账：即便挂起事件因任何
+    -- 原因未送达（事件丢失兜底），唤醒时也照样能重排定时并复核到点。
     if handler == "onResume" then
-        if S.suspended_phase == "collecting" and S.phase == "collecting" then
-            arm_collect_task()   -- 内部按 collect_end 复核；到点直接 finish("timeout")
-            logger.info("aat: resume, collect timer rebuilt")
-        elseif S.suspended_phase == "pending" and S.phase == "pending" then
+        logger.info("aat: resume received phase=", S.phase)
+        if S.phase == "collecting" then
+            -- arm_collect_task 内部先撤旧任务再按 collect_end 复核：
+            -- 未到点重排、到点直接 finish("timeout")，重复调用幂等。
+            arm_collect_task()
+            logger.info("aat: resume, collect timer re-armed")
+        elseif S.phase == "pending" then
             local now = now_s() or 0
             local remain = (S.hint_end or now) - now
             if remain <= 0 then
@@ -1105,7 +1148,7 @@ local function on_event_after(this, handler, args)
                 S.hint_task = function() begin_collecting() end
                 pcall(UIManager.scheduleIn, UIManager, remain, S.hint_task)
             end
-            logger.info("aat: resume, hint timer rebuilt remain=", remain)
+            logger.info("aat: resume, hint timer re-armed remain=", remain)
         end
         S.suspended_phase = nil
         S.last_turn_ts = nil
@@ -1121,12 +1164,16 @@ local function on_event_after(this, handler, args)
         return
     end
 
-    if handler == "onPageUpdate" and type(args) == "table" then
-        local new_page = args[1]
-        -- A3：自动翻页产生的 PageUpdate 由 wrap_schedule 的 auto_firing 计数识别，
-        -- 不入样本池；并防自激（用户若训练期手动开了 Autoturn，重新挂起）。
+    if handler == "onPageUpdate" then
+        -- 热路径减负：只有采集期才需要处理页面事件。idle（日常自动翻页 /
+        -- 手动翻页）直接返回，不去调时钟、不做去重维护——此前每次翻页
+        -- （含 30 秒一次的自动翻页）都要走 now_s()（两次 pcall）+ 状态写入，
+        -- 在长期运行中是不必要的持续分配。
+        if S.phase ~= "collecting" then return end
+        -- A3：自动翻页产生的 PageUpdate 由 wrap_schedule 的 auto_firing 计数
+        -- 识别，不入样本池；并防自激（采集期用户手动开了 Autoturn，重新挂起）。
         if S.auto_firing > 0 then
-            if S.phase == "collecting" and S.inst and is_enabled(S.inst) then
+            if S.inst and is_enabled(S.inst) then
                 logger.warn("aat: autoturn re-enabled during collection, suspending again")
                 S.inst.enabled = false
                 S.inst.autoturn_sec = CFG.suspend_sec
@@ -1134,6 +1181,7 @@ local function on_event_after(this, handler, args)
             end
             return
         end
+        local new_page = (type(args) == "table") and args[1] or nil
         on_page_changed(new_page, now_s())
         return
     end
@@ -1238,11 +1286,12 @@ end
 
 local function detach_hooks()
     local inst, ui = S.inst, S.ui
-    -- ⑥ 换书 detach 时无条件撤销两个定时句柄并复位采集态，杜绝幽灵任务。
+    -- ⑥ 换书 detach 时无条件撤销全部定时句柄并复位采集态，杜绝幽灵任务。
     clear_timers()
     S.collect_end = nil
     S.hint_end = nil
     S.suspended_phase = nil
+    S.suspend_snapshot = nil  -- 旧实例的挂起快照一并释放，不再钉住旧 AutoTurn
     S.auto_firing = 0
     S.phase = "idle"
     if ui and S.orig_handleEvent then
@@ -1280,11 +1329,12 @@ local function ensure_hooks(inst, ui)
     ui.handleEvent = function(this, event, ...)
         local r1, r2, r3 = S.orig_handleEvent(this, event, ...)
         -- 原逻辑优先；补丁观察逻辑出错绝不影响主流程。
-        pcall(function()
-            if type(event) == "table" then
-                on_event_after(this, event.handler, event.args)
-            end
-        end)
+        -- 直接以函数引用调 pcall、不新建闭包：ReaderUI.handleEvent 是全系统
+        -- 广播与输入事件的总入口（挂起/唤醒/翻页/配置刷新都经过这里），
+        -- 每个事件省掉一次闭包分配，长期运行对低内存设备更友好。
+        if type(event) == "table" then
+            pcall(on_event_after, this, event.handler, event.args)
+        end
         return r1, r2, r3
     end
     wrap_schedule(inst)

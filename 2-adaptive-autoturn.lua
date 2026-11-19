@@ -29,7 +29,9 @@
   * 触发 = 「用户开启自动翻页」：开书时不打扰用户，补丁只静默挂好 hook；
     当用户从菜单把 Autoturn 由「关→开」时（wrap_menu /
     wrap_switch_methods 拦截）才弹出间隔选择框：
-      当前间隔：X 秒/页（有数据时）/ 当前间隔：暂无数据（无数据时，点击后不开启）/ 自动设置 / 手动设置 / 取消
+      标题「即将开启自动翻页，请设置翻页间隔：」；四项：当前间隔 / 自动设置 / 手动设置 / 取消。
+    有数据时第一项显示「当前间隔：X 秒/页」并直接按该值开启；无数据时显示
+    「当前间隔：暂无数据」，点击后提示一次并重弹选择框，引导选自动/手动设置，不开启。
     「开→关」直接关闭（跳过原生「设置时间/禁用」选择框，清待机标志）。
     取消 = 不开启，保持关闭。
   * 自适应学习（自动设置）：选「自动设置」即进入流程。先弹一个页面提示，
@@ -231,7 +233,7 @@ local CFG = {
         manual      = "手动设置",
         retrain     = "自动设置",
         cancel      = "取消",
-        b_title     = "即将开启自动翻页，请选择翻页间隔设置",
+        b_title     = "即将开启自动翻页，请设置翻页间隔：",
         b_body      = "",
     },
 }
@@ -420,6 +422,7 @@ local S = {
     hint_task   = nil,      -- 「页面提示」自动关闭后启动采集的任务句柄
     hint_end    = nil,      -- 页面提示截止时刻（休眠唤醒后按剩余重建 hint_task）
     manual_retry_task = nil, -- 手动设置非法输入后延迟重开输入框的任务句柄
+    redialog_task = nil,     -- 无数据点当前间隔后延迟重弹选择框的任务句柄
     suspend_snapshot = nil,
 
     -- 休眠：挂起时撤销两个定时任务，唤醒时按剩余时长重建（避免休眠期任务与
@@ -449,6 +452,10 @@ local function clear_timers()
     if S.manual_retry_task then
         pcall(UIManager.unschedule, UIManager, S.manual_retry_task)
         S.manual_retry_task = nil
+    end
+    if S.redialog_task then
+        pcall(UIManager.unschedule, UIManager, S.redialog_task)
+        S.redialog_task = nil
     end
 end
 
@@ -729,10 +736,17 @@ end
 -- 当前间隔：直接设 autoturn_sec 并开启，不覆写 conf（提示当前设置翻页间隔，3 秒自动关闭）。
 action_use_learned = function()
     if not has_learned(S.conf) then
-        -- 无学习数据：不开启、不写值，仅提示后休眠。
-        enter_dormant()
-        show_info(L("暂无学习数据，请先用自动设置学习你的翻页节奏，自动翻页未开启。"))
-        logger.info("aat: use learned skipped, no data, stays off")
+        -- 无历史数据：不开启、不写值。提示后重弹选择框，引导用户选
+        -- 「自动设置 / 手动设置」。提示与重弹都用成熟任务机制：重弹任务
+        -- 登记进 S，随 clear_timers 撤销；任务体校验 S.ui，关书后不弹幽灵窗。
+        show_info(L("暂无当前数据，请选择自动设置或手动设置。"))
+        S.redialog_task = function()
+            S.redialog_task = nil
+            if not S.ui then return end
+            show_dialog_enable()
+        end
+        pcall(UIManager.scheduleIn, UIManager, CFG.hint_timeout, S.redialog_task)
+        logger.info("aat: no current data, re-show dialog after hint")
         return
     end
     local sec = S.conf.learned_sec

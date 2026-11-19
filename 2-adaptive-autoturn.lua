@@ -29,10 +29,10 @@
   * 触发 = 「用户开启自动翻页」：开书时不打扰用户，补丁只静默挂好 hook；
     当用户从菜单把 Autoturn 由「关→开」时（wrap_menu /
     wrap_switch_methods 拦截）才弹出间隔选择框：
-      当前间隔：X 秒/页（有数据时）/ 重新训练 / 手动设置 / 取消
+      当前间隔：X 秒/页（有数据时）/ 自动设置 / 手动设置 / 取消
     「开→关」直接关闭（跳过原生「设置时间/禁用」选择框，清待机标志）。
     取消 = 不开启，保持关闭。
-  * 自适应学习（重新训练）：选「重新训练」即进入流程。先弹一个页面提示，
+  * 自适应学习（自动设置）：选「自动设置」即进入流程。先弹一个页面提示，
     默认 hint_timeout(3) 秒自动关闭；提示关闭后才正式开始分析采集
     （pending→collecting），刚点完按钮、提示还在时的翻页不会计入样本。
     采集期关闭 Autoturn、纯手动翻页采样。
@@ -66,7 +66,7 @@
     两者都拿不到才 logger.warn 并放弃拦截（此时补丁静默，不影响原生行为）。
     挂起/恢复一律用 pcall 探测到的真实字段与方法（enabled + autoturn_sec +
     _unschedule/_schedule），绝不硬编码不存在的符号。
-    「使用已有数据/重新训练/手动设置」的开启交回 AutoTurn 原生路径：补齐
+    「当前间隔/自动设置/手动设置」的开启交回 AutoTurn 原生路径：补齐
     原生 callback 的三项副作用（写 autoturn_timeout_seconds / autoturn_enabled、
     挂 self.onResume = self._onResume），再 _unschedule() + _start()，让
     PluginShare.pause_auto_suspend 由原生 _start(true)/_unschedule(false) 成对
@@ -224,10 +224,10 @@ local CFG = {
         use_learned = "使用已有数据",
         current     = "当前间隔：%d 秒/页",
         manual      = "手动设置",
-        retrain     = "重新训练",
+        retrain     = "自动设置",
         cancel      = "取消",
-        b_title     = "自适应自动翻页",
-        b_body      = "自动翻页已开启，请选择翻页间隔方式：",
+        b_title     = "即将开启自动翻页，请选择翻页间隔设置",
+        b_body      = "",
     },
 }
 
@@ -733,12 +733,12 @@ apply_value = function(sec, trained, msg)
     show_info(msg)
 end
 
--- 使用已有数据：直接设 autoturn_sec 并开启，不覆写 conf。
+-- 当前间隔：直接设 autoturn_sec 并开启，不覆写 conf（提示当前设置翻页间隔，3 秒自动关闭）。
 action_use_learned = function()
     local sec = has_learned(S.conf) and S.conf.learned_sec or CFG.default_sec
     resume_autoturn(S.inst, sec)
     enter_dormant()
-    show_info(string.format(L("已使用已有数据，自动翻页间隔 %d 秒。"), sec))
+    show_info(string.format(L("当前设置翻页间隔：%d 秒/页。"), sec))
     logger.info("aat: use learned sec=", sec)
 end
 
@@ -766,7 +766,7 @@ abort_collection = function(msg)
     show_info(msg, 6)
 end
 
--- 间隔选择框里选「重新训练」直接进这里。
+-- 间隔选择框里选「自动设置」直接进这里。
 -- 主结束条件是采够 target_samples，train_timeout_min 仅作兜底超时。
 start_collection = function()
     local inst, ui = S.inst, S.ui
@@ -869,7 +869,7 @@ end
 -- ---------------------------------------------------------------- 弹窗 B ----
 -- 唯一触发入口：用户开启自动翻页（Autoturn 由关→开）时由 wrap_menu /
 -- wrap_switch_methods 拦截后弹出。开书阶段保持静默，不打扰用户。
--- 「重新训练」直接 start_collection：采够 target_samples 自动结束，
+-- 「自动设置」直接 start_collection：采够 target_samples 自动结束，
 -- train_timeout_min 分钟兜底超时。
 show_dialog_enable = function()
     local learned = has_learned(S.conf) and S.conf.learned_sec or nil

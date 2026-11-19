@@ -49,11 +49,12 @@ A few decisions follow from that idea:
 
 **Learning flow**
 
-1. A **3-second page hint** appears. AutoTurn is suspended and no samples are counted yet — the taps you make while the hint is still on screen are never recorded.
+1. A **3-second page hint** — "Learning your page-turn rhythm, please keep turning pages manually." — appears. AutoTurn is suspended and no samples are counted yet — the taps you make while the hint is still on screen are never recorded.
 2. When the hint closes, collection starts. AutoTurn stays off; you turn pages by hand as usual.
 3. Collection ends as soon as **40 valid intervals** have been gathered, or early after **20 minutes with at least 15 valid samples** so slow readers need not wait the full cap — with a **30-minute** final timeout, whichever comes first.
 4. The learned interval is written to settings and AutoTurn is enabled at that value.
 5. If there is not enough valid data, the existing learned value is left untouched and AutoTurn stays off; a 3-second hint is shown. You can enable AutoTurn again and retry "Auto setup".
+6. **To cancel mid-collection**, tap the AutoTurn menu item (or switch) again. This aborts collection, keeps AutoTurn off, writes nothing, and lets you start again anytime.
 
 ### How the interval is computed
 

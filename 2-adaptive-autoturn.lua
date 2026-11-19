@@ -328,9 +328,9 @@ end
 local function compute_learned(samples)
     local n = #samples
     if n < CFG.min_samples then return nil, "samples_lt_min" end
-    local ordered = {}
-    for i = 1, n do ordered[i] = samples[i].v end
-    local kept = trim_outliers(ordered)
+    -- 样本已按纯数字存放，直接交给 trim_outliers（它内部 sorted_copy 不改动
+    -- 入参），省掉旧版把 samples[i].v 拷进 ordered 的整表复制。
+    local kept = trim_outliers(samples)
     if #kept < CFG.min_after_trim then return nil, "trim_lt_min" end
     local value = clamp(mean(kept), CFG.min_sec, CFG.max_sec)
     return math.floor(value + 0.5)
@@ -409,7 +409,7 @@ local S = {
 
     -- 采集
     phase       = "idle",   -- idle / pending(页面提示中) / collecting
-    samples     = {},       -- { {v=dt, t=monotonic}, ... }
+    samples     = {},       -- { dt, dt, ... } 纯间隔数字数组（上限 target_samples）
     last_page   = nil,
     last_turn_ts  = nil,    -- 上次「有效前序翻页」单调时刻
     last_sig_page = nil,    -- PageUpdate 去重：同页短时窗只记一次
@@ -1103,9 +1103,11 @@ on_page_changed = function(new_page, ts_mono)
         S.burst = 0
         return
     end
-    -- B3 入池
+    -- B3 入池：只存间隔数字本身。旧版存 {v=gap, t=ts_mono}，其中 t 自
+    -- 取消近期加权后从未被读取，纯属死字段；直接存数字可省掉每样本一次
+    -- table 分配及一个数字字段，采集期内存占用更低，统计口径完全不变。
     S.burst = 0
-    S.samples[#S.samples + 1] = { v = gap, t = ts_mono }
+    S.samples[#S.samples + 1] = gap
     logger.info(string.format("aat: sample %.1f (%d/%d)",
         gap, #S.samples, CFG.target_samples))
     -- 主结束条件：采够 target_samples 即结算；另按时间自适应提前结算。

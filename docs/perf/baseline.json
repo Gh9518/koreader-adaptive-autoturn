@@ -1,0 +1,107 @@
+{
+  "meta": {
+    "captured_at": "2026-11-20T00:46:00+08:00",
+    "phase": "0",
+    "description": "优化前基线。所有数字均为本机沙箱实测；无法采集项标注 unmeasurable 与原因，不编造。",
+    "measurement_notes": {
+      "load_ms": "Lua 5.1.5 stub 环境 pcall(dofile) 冷加载单次 os.clock 计时，非真机 KOReader；真机冷启动口径不同。",
+      "mem_delta_kb": "collectgarbage(count) 前后差值，仅 Lua VM 堆，不含 mupdf/宿主进程 RSS。",
+      "idle_timers": "补丁注册完成后 UIManager 任务队列长度（idle 态）。"
+    }
+  },
+  "project": {
+    "name": "adaptive-autoturn (2-adaptive-autoturn.lua)",
+    "type": "KOReader user patch (single-file Lua monkey-patch)",
+    "language": "Lua 5.1",
+    "build_system": "none (纯解释执行的 userpatch，无编译/打包步骤)",
+    "runtime": "KOReader (eReader embedded, LuaJIT/Lua 5.1)",
+    "entry": "2-adaptive-autoturn.lua -> apply() -> userpatch.registerPatchPluginFunc('autoturn', ...)",
+    "code_size": {
+      "main_lua_lines": 1566,
+      "main_lua_bytes": 77392,
+      "function_count": 32,
+      "readme_lines": 176
+    }
+  },
+  "metrics": {
+    "build_time": {
+      "value": null,
+      "status": "unmeasurable",
+      "reason": "项目无构建系统，为直接解释执行的 Lua 脚本；不存在编译/打包步骤。"
+    },
+    "build_warnings": {
+      "value": null,
+      "status": "unmeasurable",
+      "reason": "同上，无构建步骤故无构建告警。"
+    },
+    "artifact_size_bytes": {
+      "value": 77392,
+      "status": "measured",
+      "note": "2-adaptive-autoturn.lua 文件大小（唯一运行时产物）。"
+    },
+    "cold_load_ms": {
+      "value": 1.130,
+      "unit": "ms",
+      "status": "measured",
+      "note": "stub 环境单次冷加载；真机首次加载耗时不可测（无设备）。"
+    },
+    "key_operation_latency": {
+      "value": null,
+      "status": "unmeasurable",
+      "reason": "关键操作（弹窗/采样/结算）依赖真机 UIManager 事件循环与渲染，沙箱 stub 无法给出有代表性时延。"
+    },
+    "peak_memory_kb": {
+      "value": 4.447,
+      "unit": "KB (Lua VM heap delta)",
+      "status": "measured",
+      "note": "加载后 Lua 堆增量；真机峰值 RSS 不可测（无设备/无宿主进程）。"
+    },
+    "lint_warnings": {
+      "value": null,
+      "status": "unmeasurable",
+      "reason": "仓库未配置 lucheck/luacheck 等 lint 工具且无配置文件；阶段 0 不新增工具链到项目。仅做了 luac5.1 -p 语法校验（通过，非 lint）。"
+    },
+    "typecheck_warnings": {
+      "value": null,
+      "status": "unmeasurable",
+      "reason": "Lua 5.1 为动态类型，项目无 typecheck 配置。"
+    },
+    "syntax_check": {
+      "value": "pass",
+      "status": "measured",
+      "command": "luac5.1 -p /workspace/2-adaptive-autoturn.lua"
+    },
+    "tests": {
+      "total": 212,
+      "passed": 212,
+      "failed": 0,
+      "pass_rate": "100%",
+      "status": "measured",
+      "counting_note": "按实际 'PASS:' 输出行计数（grep -c '^PASS:'）。test_v10_close.lua 的汇总行打印的是累计 PASS 变量快照（K=15/M=27/N=42/P=53 为累计值），非各组独立数；各组实际为 K=15/M=12/N=15/P=11，合计 53。",
+      "suites": {
+        "test_v10.lua": { "pass": 148, "fail": 0 },
+        "test_v10_fallback.lua": { "pass": 11, "fail": 0 },
+        "test_v10_close.lua": { "K": 15, "M": 12, "N": 15, "P": 11, "pass": 53, "fail": 0 }
+      },
+      "command": "lua5.1 test_v10.lua / test_v10_fallback.lua / test_v10_close.lua"
+    },
+    "idle_background_activity": {
+      "idle_timers": 0,
+      "polling": false,
+      "background_tasks": 0,
+      "status": "measured",
+      "note": "idle 态补丁自身排定任务数为 0；无轮询/心跳。原生 AutoTurn 关闭时不排任务。"
+    },
+    "global_writes": {
+      "value": 0,
+      "status": "measured",
+      "note": "静态扫描：无裸全局赋值；依赖经 pcall(require) 局部化；唯一持久化入口为 G_reader_settings 表字段（非全局符号写入）。"
+    }
+  },
+  "artifact_hashes_sha256": {
+    "2-adaptive-autoturn.lua": "1cd9d2bad62be4580509febdc23788ff62c1a643a65463d5281cd2b29239d821",
+    "README.md": "e0d63ad642765af0138037a825a7d50d8ca6f0b4f092a77b5db3b71626e3b8f6",
+    "README.zh-CN.md": "9c300dcc12c20f12854ccf9ea947b7bbc32623e1d6148d862066dd7cd84ed299",
+    "LICENSE": "270b56165ce3b897691e5c15954e055f67e06f194f9da5a53745c35d54dde45d"
+  }
+}

@@ -29,7 +29,7 @@
   * 触发 = 「用户开启自动翻页」：开书时不打扰用户，补丁只静默挂好 hook；
     当用户从菜单把 Autoturn 由「关→开」时（wrap_menu /
     wrap_switch_methods 拦截）才弹出间隔选择框：
-      当前间隔：X 秒/页（有数据时）/ 默认间隔：45 秒/页（无数据时，可用）/ 自动设置 / 手动设置 / 取消
+      当前间隔：X 秒/页（有数据时）/ 当前间隔：暂无数据（无数据时，点击后不开启）/ 自动设置 / 手动设置 / 取消
     「开→关」直接关闭（跳过原生「设置时间/禁用」选择框，清待机标志）。
     取消 = 不开启，保持关闭。
   * 自适应学习（自动设置）：选「自动设置」即进入流程。先弹一个页面提示，
@@ -39,8 +39,8 @@
   * 结束条件（先到先结算）：采够 target_samples(40) 个有效间隔即自动结束；
     或采集满 adaptive_min_minutes(20) 分钟且样本 >= adaptive_min_samples(15)
     即提前结算（慢速读者无需等满 30 分钟）；train_timeout_min(30) 分钟为最终
-    兜底超时。结算后写学习值、
-    开启 Autoturn 并设为学习值；有效样本不足用 default_sec 并提示可重试。
+    兜底超时。结算后写学习值并开启 Autoturn；有效样本不足 / 无数据则不开启，
+    仅提示一次后休眠，不写值、不按任何默认值开启。
   * 手动设置：InputDialog 输入 3~120 的整数，写入学习值并开启 Autoturn。
   * 统计口径：双侧只剔除「异常」间隔、合理范围内一律保留、取全期均值。
       - 上侧（特别大）：> 中位数 × outlier_factor，离开/走神造成的超长间隔。
@@ -104,7 +104,7 @@
     调用。补丁自排的全部定时任务（含非法输入后的延迟重开输入框）都登记
     句柄并随 clear_timers 一并撤销，重开任务体校验关书后不再弹窗。
   * ButtonDialog 的按钮回调不会自动关闭（buttontable.lua:80-85 只调
-    btn_entry.callback），必须显式 UIManager:close(dlg)；ConfirmBox 才会自动关。
+    btn_entry.callback），必须显式 UIManager:close(dlg)。
     ButtonTable 支持 enabled=false 置灰按钮（button.lua:485）。InputDialog
     用 input_type="number" + getInputText()，按钮回调同样不自动关闭。
 
@@ -137,8 +137,6 @@
   | outlier_factor       | 3         | 上侧：剔除 > 中位数×此值的特别大间隔 |
   | small_outlier_ratio  | 0.4       | 下侧：剔除 < 中位数×此值的相对异常小值 |
   | min_sec / max_sec    | 3 / 120   | 学习值 clamp 区间 |
-  | default_sec          | 120       | 采集失败兜底间隔（保守值） |
-  | default_interval     | 45        | 无学习数据时「默认间隔」按钮的间隔 |
 
 约束落实：
   * 纯 Lua 5.1；全部局部量，零全局写入（luac -l 校验 SETGLOBAL=0）。
@@ -179,7 +177,6 @@ local ok_pl, PluginLoader  = pcall(require, "pluginloader")
 local ok_up, userpatch     = pcall(require, "userpatch")
 
 local ok_IM, InfoMessage   = pcall(require, "ui/widget/infomessage")
-local ok_CB, ConfirmBox    = pcall(require, "ui/widget/confirmbox")
 local ok_BD, ButtonDialog  = pcall(require, "ui/widget/buttondialog")
 local ok_ID, InputDialog   = pcall(require, "ui/widget/inputdialog")
 
@@ -224,15 +221,12 @@ local CFG = {
     -- 学习值
     min_sec        = 3,
     max_sec        = 120,
-    default_sec    = 120,
-    -- 无学习数据时「默认间隔」按钮的间隔（新用户一键开启的合理起点）
-    default_interval = 45,
 
     -- 兜底挂起间隔（秒）：足够大，采集期即使被误开启也不会立刻翻页
     suspend_sec    = 86400,
 
     LANG = {
-        use_learned = "默认间隔：%d 秒/页",
+        no_data     = "当前间隔：暂无数据",
         current     = "当前间隔：%d 秒/页",
         manual      = "手动设置",
         retrain     = "自动设置",
@@ -503,7 +497,6 @@ local function probe_all(inst, ui)
     p.time            = (ok_time and type(time) == "table" and type(time.to_number) == "function")
     p.InputDialog     = (ok_ID and type(InputDialog) == "table")
     p.ButtonDialog    = (ok_BD and type(ButtonDialog) == "table")
-    p.ConfirmBox      = (ok_CB and type(ConfirmBox) == "table")
     p.InfoMessage     = (ok_IM and type(InfoMessage) == "table")
 
     -- 开关方法：候选方法逐个探测，一个都不硬编码为「必然存在」。
@@ -564,21 +557,6 @@ local function show_buttons(title, body, rows)
     end)
     if not ok then logger.warn("aat: show_buttons failed") end
     return ok
-end
-
--- ConfirmBox 的按钮回调会自动 close（confirmbox.lua:135-141）。
--- 用于「采集失败，是否重试」这类二选一确认。
-local function show_confirm(text, ok_text, ok_fn, cancel_text, cancel_fn)
-    if not (ok_CB and type(ConfirmBox) == "table") then return false end
-    return pcall(function()
-        UIManager:show(ConfirmBox:new{
-            text = text,
-            ok_text = ok_text,
-            cancel_text = cancel_text or L(CFG.LANG.cancel),
-            ok_callback = function() if ok_fn then pcall(ok_fn) end end,
-            cancel_callback = function() if cancel_fn then pcall(cancel_fn) end end,
-        })
-    end) == true
 end
 
 -- ---------------------------------------------------------------- Autoturn --
@@ -750,14 +728,17 @@ end
 
 -- 当前间隔：直接设 autoturn_sec 并开启，不覆写 conf（提示当前设置翻页间隔，3 秒自动关闭）。
 action_use_learned = function()
-    local has_data = has_learned(S.conf)
-    local sec = has_data and S.conf.learned_sec or CFG.default_interval
+    if not has_learned(S.conf) then
+        -- 无学习数据：不开启、不写值，仅提示后休眠。
+        enter_dormant()
+        show_info(L("暂无学习数据，请先用自动设置学习你的翻页节奏，自动翻页未开启。"))
+        logger.info("aat: use learned skipped, no data, stays off")
+        return
+    end
+    local sec = S.conf.learned_sec
     resume_autoturn(S.inst, sec)
     enter_dormant()
-    local msg = has_data
-        and string.format(L("当前设置翻页间隔：%d 秒/页。"), sec)
-        or string.format(L("已按默认间隔 %d 秒/页开启，可自动设置学习你的节奏。"), sec)
-    show_info(msg)
+    show_info(string.format(L("当前设置翻页间隔：%d 秒/页。"), sec))
     logger.info("aat: use learned sec=", sec)
 end
 
@@ -914,7 +895,7 @@ show_dialog_enable = function()
     local learned = has_learned(S.conf) and S.conf.learned_sec or nil
     local label = learned
         and string.format(L(CFG.LANG.current), learned)
-        or string.format(L(CFG.LANG.use_learned), CFG.default_interval)
+        or L(CFG.LANG.no_data)
     show_buttons(L(CFG.LANG.b_title), L(CFG.LANG.b_body), {
         {
             { text = label, fn = action_use_learned },
@@ -1121,7 +1102,7 @@ end
 --   ① 采够 target_samples(40) 个有效样本即结束；
 --   ② 或采集已满 adaptive_min_minutes(20) 分钟且样本 >= adaptive_min_samples(15)
 --      即提前结算——慢速读者不必等满 30 分钟兜底。
--- 两条件先到先触发，均不改变「样本不足仍走 compute_learned / default_sec」的结算语义。
+-- 两条件先到先触发，均不改变「样本不足则不开启、仅提示」的结算语义。
 should_finish_early = function()
     if S.phase ~= "collecting" then return false end
     local n = #S.samples
@@ -1154,19 +1135,11 @@ finish_collection = function(reason)
         logger.info(string.format("aat: collection done reason= %s samples=%d learned=%s",
             tostring(reason), n, tostring(learned)))
     else
-        -- 采集失败（超时未采够或异常值过多被剔光）：不改全局值，用 default_sec
-        -- 开启并提示可重试；重试直接重新采集。
-        local fb = CFG.default_sec
-        resume_autoturn(S.inst, fb)
-        local msg = string.format(
-            L("有效样本不足或异常值过多，自动翻页已按默认 %d 秒开启，可重新训练。"), fb)
-        if not show_confirm(msg, L(CFG.LANG.retrain),
-                            function() start_collection() end,
-                            L(CFG.LANG.cancel), nil) then
-            show_info(msg, 6)
-        end
-        logger.warn(string.format("aat: collection failed reason= %s why=%s samples=%d fallback=%d",
-            tostring(reason), tostring(why), n, fb))
+        -- 采集失败（超时未采够或异常值过多被剔光）：不写值、不开启、不重试，
+        -- 仅提示一次后休眠。用户可再次开启自动翻页重新自动设置。
+        show_info(L("有效样本不足，自动翻页未开启，可再次开启并自动设置重试。"))
+        logger.warn(string.format("aat: collection failed reason= %s why=%s samples=%d stays=off",
+            tostring(reason), tostring(why), n))
     end
 end
 

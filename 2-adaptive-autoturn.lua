@@ -37,7 +37,9 @@
     （pending→collecting），刚点完按钮、提示还在时的翻页不会计入样本。
     采集期关闭 Autoturn、纯手动翻页采样。
   * 结束条件（先到先结算）：采够 target_samples(40) 个有效间隔即自动结束；
-    另设 train_timeout_min(30) 分钟兜底超时，防止一直采不够。结算后写学习值、
+    或采集满 adaptive_min_minutes(20) 分钟且样本 >= adaptive_min_samples(15)
+    即提前结算（慢速读者无需等满 30 分钟）；train_timeout_min(30) 分钟为最终
+    兜底超时。结算后写学习值、
     开启 Autoturn 并设为学习值；有效样本不足用 default_sec 并提示可重试。
   * 手动设置：InputDialog 输入 3~120 的整数，写入学习值并开启 Autoturn。
   * 统计口径：双侧只剔除「异常」间隔、合理范围内一律保留、取全期均值。
@@ -124,6 +126,8 @@
   | hint_timeout         | 3         | 交互后页面提示自动关闭秒数，关闭后才开始采集 |
   | target_samples       | 40        | 采够这么多个有效间隔即自动结束（主结束条件） |
   | train_timeout_min    | 30        | 兜底超时（分钟），防止一直采不够 |
+  | adaptive_min_minutes | 20        | 采满这么久且样本够 adaptive_min_samples 即提前结算 |
+  | adaptive_min_samples | 15        | 提前结算所需的最少有效样本数 |
   | min_interval         | 2         | 连翻/抖动阈值（秒），B1 丢弃并计 burst |
   | abs_min_keep         | 6         | 特别小的异常间隔下限（秒），低于它不入池；如 5s |
   | max_interval         | 300       | 最长有效间隔（秒），B2 丢弃 |
@@ -196,6 +200,10 @@ local CFG = {
     -- 分钟为兜底超时，防止一直采不够。
     target_samples    = 40,
     train_timeout_min = 30,
+    -- 时间自适应提前结算：采集满 adaptive_min_minutes 且有
+    -- adaptive_min_samples 个有效样本即结束，避免慢速读者等满 30 分钟。
+    adaptive_min_minutes  = 20,
+    adaptive_min_samples  = 15,
 
     -- 采样
     min_interval   = 2,     -- 连翻/抖动阈值：gap<2 丢弃并计 burst
@@ -412,6 +420,8 @@ local S = {
     last_sig_ts   = nil,
     burst       = 0,        -- 连续 dt<min_interval 计数
     collect_end = nil,      -- 兜底超时截止时刻（getElapsedTimeSinceBoot，含待机的墙上单调时钟）
+    collect_start = nil,    -- 采集起始墙钟（getElapsedTimeSinceBoot），用于时间自适应判定
+    adaptive_checked = nil, -- 自适应复核点是否已检查过（避免重排回 20 分钟点死循环）
     collect_task = nil,     -- 兜底超时倒计时任务句柄（采够样本会提前撤销）
     hint_task   = nil,      -- 「页面提示」自动关闭后启动采集的任务句柄
     hint_end    = nil,      -- 页面提示截止时刻（休眠唤醒后按剩余重建 hint_task）
@@ -463,6 +473,8 @@ local function enter_dormant()
     S.burst = 0
     S.auto_firing = 0
     S.collect_end = nil
+    S.collect_start = nil
+    S.adaptive_checked = nil
     S.hint_end = nil
     S.suspended_phase = nil
     S.suspend_snapshot = nil
@@ -720,7 +732,7 @@ end
 -- 采集流程与弹窗互相引用，统一前向声明后逐个赋值，避免任何全局函数。
 local on_page_changed, finish_collection, abort_collection,
       start_collection, begin_collecting, arm_collect_task, show_manual_dialog,
-      show_dialog_enable,
+      show_dialog_enable, should_finish_early,
       action_use_learned, action_cancel_enable, apply_value, detach_hooks
 
 -- 落地：写学习值到 G_reader_settings + 开启 + 提示。持久化失败只记日志，
@@ -817,12 +829,14 @@ start_collection = function()
     S.burst = 0
     S.auto_firing = 0
     S.collect_end = nil
+    S.collect_start = nil
+    S.adaptive_checked = nil
     S.hint_end = (now_s() or 0) + CFG.hint_timeout
     S.suspended_phase = nil
 
     show_info(string.format(
-        L("即将开始采集：采够 %d 个翻页间隔会自动结束（最长 %d 分钟）。本提示 %d 秒后自动关闭，之后开始分析采集；期间自动翻页已关闭，请正常手动翻页。"),
-        CFG.target_samples, CFG.train_timeout_min, CFG.hint_timeout))
+        L("即将开始采集：采够 %d 个翻页间隔，或读满 %d 分钟后自动结束（最长 %d 分钟）。本提示 %d 秒后自动关闭，之后开始分析采集；期间自动翻页已关闭，请正常手动翻页。"),
+        CFG.target_samples, CFG.adaptive_min_minutes, CFG.train_timeout_min, CFG.hint_timeout))
     logger.info(string.format("aat: page hint shown, collect in %ss", tostring(CFG.hint_timeout)))
 
     -- 只用一个任务句柄驱动「提示关闭 → 开始采集」，切书/中止/休眠时可 unschedule。
@@ -839,16 +853,32 @@ arm_collect_task = function()
     if S.phase ~= "collecting" then return end
     if S.collect_task then pcall(UIManager.unschedule, UIManager, S.collect_task) end
     local now = now_s() or 0
-    local remain = (S.collect_end or now) - now
+    -- 唤醒重建等场景：墙钟可能已越过自适应点且样本够，立即结算，不等 30 分钟。
+    if should_finish_early() then return end
+    -- 复核点先设在「自适应提前结算时刻」；若该时刻已过或已复核过，则用 collect_end。
+    -- 这样慢速读者采满 adaptive_min_minutes 即有任务叫醒复核，不必等满 30 分钟，
+    -- 也不依赖「用户恰好在 20 分钟后又翻一页」这种不可靠条件。
+    local adaptive_at = (S.collect_start or now) + CFG.adaptive_min_minutes * 60
+    local target = S.collect_end or now
+    if not S.adaptive_checked and now < adaptive_at and adaptive_at < target then
+        target = adaptive_at
+    else
+        S.adaptive_checked = true
+    end
+    local remain = target - now
     if remain <= 0 then
+        if should_finish_early() then return end
         finish_collection("timeout")
         return
     end
     S.collect_task = function()
         if S.phase ~= "collecting" then return end
+        -- 到点复核：先判提前结算（40 样本 / 满20分钟+够样本）。
+        if should_finish_early() then return end
         local n2 = now_s() or 0
-        -- 任务被提前触发（KOReader 唤醒平移任务队列）时按剩余重排，不误结算。
+        -- 尚未到 collect_end（自适应点复核后样本不足，或任务被唤醒平移提前触发）：重排。
         if S.collect_end and n2 < S.collect_end - 0.5 then
+            S.adaptive_checked = true
             arm_collect_task()
             return
         end
@@ -865,7 +895,9 @@ begin_collecting = function()
     S.hint_task = nil
     S.hint_end = nil
     S.phase = "collecting"
-    S.collect_end = (now_s() or 0) + CFG.train_timeout_min * 60
+    S.collect_start = (now_s() or 0)
+    S.adaptive_checked = false
+    S.collect_end = S.collect_start + CFG.train_timeout_min * 60
     S.auto_firing = 0
     S.suspended_phase = nil
     logger.info(string.format("aat: hint closed, collection started target=%d timeout=%dmin",
@@ -1081,8 +1113,30 @@ on_page_changed = function(new_page, ts_mono)
     S.samples[#S.samples + 1] = { v = gap, t = ts_mono }
     logger.info(string.format("aat: sample %.1f (%d/%d)",
         gap, #S.samples, CFG.target_samples))
-    -- 主结束条件：采够足够数据量即结算；兜底超时由 finish_collection 撤销。
-    if #S.samples >= CFG.target_samples then finish_collection("enough") end
+    -- 主结束条件：采够 target_samples 即结算；另按时间自适应提前结算。
+    if should_finish_early() then return end
+end
+
+-- 提前结算判定（翻页入池后、兜底任务复核时都调用）：
+--   ① 采够 target_samples(40) 个有效样本即结束；
+--   ② 或采集已满 adaptive_min_minutes(20) 分钟且样本 >= adaptive_min_samples(15)
+--      即提前结算——慢速读者不必等满 30 分钟兜底。
+-- 两条件先到先触发，均不改变「样本不足仍走 compute_learned / default_sec」的结算语义。
+should_finish_early = function()
+    if S.phase ~= "collecting" then return false end
+    local n = #S.samples
+    if n >= CFG.target_samples then
+        finish_collection("enough")
+        return true
+    end
+    if n >= CFG.adaptive_min_samples then
+        local elapsed = (now_s() or 0) - (S.collect_start or (now_s() or 0))
+        if elapsed >= CFG.adaptive_min_minutes * 60 then
+            finish_collection("adaptive")
+            return true
+        end
+    end
+    return false
 end
 
 -- ---------------------------------------------------------------- 结束 ------
@@ -1130,6 +1184,8 @@ local function on_event_after(this, handler, args)
         S.phase = "idle"
         S.auto_firing = 0
         S.collect_end = nil
+        S.collect_start = nil
+        S.adaptive_checked = nil
         S.hint_end = nil
         S.suspended_phase = nil
         S.samples = {}

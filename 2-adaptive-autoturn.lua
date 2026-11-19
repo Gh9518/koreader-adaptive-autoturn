@@ -423,6 +423,7 @@ local S = {
     hint_end    = nil,      -- 页面提示截止时刻（休眠唤醒后按剩余重建 hint_task）
     manual_retry_task = nil, -- 手动设置非法输入后延迟重开输入框的任务句柄
     redialog_task = nil,     -- 无数据点当前间隔后延迟重弹选择框的任务句柄
+    active_dialog = nil,     -- 当前补丁弹窗（ButtonDialog/InputDialog），防连点叠加
     suspend_snapshot = nil,
 
     -- 休眠：挂起时撤销两个定时任务，唤醒时按剩余时长重建（避免休眠期任务与
@@ -532,6 +533,17 @@ local function show_info(text, timeout)
     end)
 end
 
+-- 连续点击防叠加：同一时刻只保留一个补丁交互弹窗。弹新窗前先关掉上一个，
+-- 避免多次「关→开」堆叠出多个窗口与多个虚拟键盘实例——后者正是第三方拼音
+-- 输入法插件（如 pinyin_enhancement）注入 nil 字符、导致崩溃的竞态温床。
+local function close_active_dialog()
+    if S.active_dialog then
+        local d = S.active_dialog
+        S.active_dialog = nil
+        pcall(function() UIManager:close(d) end)
+    end
+end
+
 -- ButtonDialog 的按钮回调不会自动关闭，统一显式 close 后再执行动作。
 -- enabled 显式给布尔值，避免 nil 被解释成禁用（button.lua 默认 true）。
 local function show_buttons(title, body, rows)
@@ -539,6 +551,7 @@ local function show_buttons(title, body, rows)
         logger.warn("aat: ButtonDialog unavailable")
         return false
     end
+    close_active_dialog()
     local dlg
     local buttons = {}
     for _, row in ipairs(rows) do
@@ -550,6 +563,7 @@ local function show_buttons(title, body, rows)
                 enabled = (b.enabled ~= false),
                 callback = function()
                     if dlg then pcall(function() UIManager:close(dlg) end) end
+                    if S.active_dialog == dlg then S.active_dialog = nil end
                     if action then pcall(action) end
                 end,
             }
@@ -561,6 +575,7 @@ local function show_buttons(title, body, rows)
         if body and body ~= "" then text = title .. "\n" .. body end
         dlg = ButtonDialog:new{ title = text, buttons = buttons }
         UIManager:show(dlg)
+        S.active_dialog = dlg
     end)
     if not ok then logger.warn("aat: show_buttons failed") end
     return ok
@@ -930,6 +945,7 @@ show_manual_dialog = function(from_enable, initial_val)
         show_info(L("本设备不支持输入框，无法手动设置。"))
         return
     end
+    close_active_dialog()
     local default_val = initial_val or (has_learned(S.conf) and S.conf.learned_sec or 30)
     local dlg
     pcall(function()
@@ -943,6 +959,7 @@ show_manual_dialog = function(from_enable, initial_val)
                 {
                     { text = L(CFG.LANG.cancel), callback = function()
                         if dlg then pcall(function() UIManager:close(dlg) end) end
+                        if S.active_dialog == dlg then S.active_dialog = nil end
                         if from_enable then action_cancel_enable() end
                     end },
                     { text = L("确定"), is_enter_default = true, callback = function()
@@ -952,6 +969,7 @@ show_manual_dialog = function(from_enable, initial_val)
                             if ok_get then raw = txt end
                         end
                         if dlg then pcall(function() UIManager:close(dlg) end) end
+                        if S.active_dialog == dlg then S.active_dialog = nil end
                         local v = tonumber(raw)
                         if not v or v ~= math.floor(v) or v < CFG.min_sec or v > CFG.max_sec then
                             show_info(L("输入无效，请输入 3~120 的整数。"))
@@ -974,6 +992,7 @@ show_manual_dialog = function(from_enable, initial_val)
             },
         }
         UIManager:show(dlg)
+        S.active_dialog = dlg
         if type(dlg.onShowKeyboard) == "function" then pcall(dlg.onShowKeyboard, dlg) end
     end)
 end
@@ -1434,6 +1453,7 @@ local function detach_hooks()
     local inst, ui = S.inst, S.ui
     -- ⑥ 换书 detach 时无条件撤销全部定时句柄并复位采集态，杜绝幽灵任务。
     clear_timers()
+    close_active_dialog()
     S.collect_end = nil
     S.hint_end = nil
     S.suspended_phase = nil

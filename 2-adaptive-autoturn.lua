@@ -29,7 +29,7 @@
   * 触发 = 「用户开启自动翻页」：开书时不打扰用户，补丁只静默挂好 hook；
     当用户从菜单把 Autoturn 由「关→开」时（wrap_menu /
     wrap_switch_methods 拦截）才弹出间隔选择框：
-      当前间隔：X 秒/页（有数据时）/ 自动设置 / 手动设置 / 取消
+      当前间隔：X 秒/页（有数据时）/ 默认间隔：45 秒/页（无数据时，可用）/ 自动设置 / 手动设置 / 取消
     「开→关」直接关闭（跳过原生「设置时间/禁用」选择框，清待机标志）。
     取消 = 不开启，保持关闭。
   * 自适应学习（自动设置）：选「自动设置」即进入流程。先弹一个页面提示，
@@ -133,7 +133,8 @@
   | outlier_factor       | 3         | 上侧：剔除 > 中位数×此值的特别大间隔 |
   | small_outlier_ratio  | 0.4       | 下侧：剔除 < 中位数×此值的相对异常小值 |
   | min_sec / max_sec    | 3 / 120   | 学习值 clamp 区间 |
-  | default_sec          | 120       | 采集失败或手动框默认间隔 |
+  | default_sec          | 120       | 采集失败兜底间隔（保守值） |
+  | default_interval     | 45        | 无学习数据时「默认间隔」按钮的间隔 |
 
 约束落实：
   * 纯 Lua 5.1；全部局部量，零全局写入（luac -l 校验 SETGLOBAL=0）。
@@ -216,12 +217,14 @@ local CFG = {
     min_sec        = 3,
     max_sec        = 120,
     default_sec    = 120,
+    -- 无学习数据时「默认间隔」按钮的间隔（新用户一键开启的合理起点）
+    default_interval = 45,
 
     -- 兜底挂起间隔（秒）：足够大，采集期即使被误开启也不会立刻翻页
     suspend_sec    = 86400,
 
     LANG = {
-        use_learned = "使用已有数据",
+        use_learned = "默认间隔：%d 秒/页",
         current     = "当前间隔：%d 秒/页",
         manual      = "手动设置",
         retrain     = "自动设置",
@@ -735,10 +738,14 @@ end
 
 -- 当前间隔：直接设 autoturn_sec 并开启，不覆写 conf（提示当前设置翻页间隔，3 秒自动关闭）。
 action_use_learned = function()
-    local sec = has_learned(S.conf) and S.conf.learned_sec or CFG.default_sec
+    local has_data = has_learned(S.conf)
+    local sec = has_data and S.conf.learned_sec or CFG.default_interval
     resume_autoturn(S.inst, sec)
     enter_dormant()
-    show_info(string.format(L("当前设置翻页间隔：%d 秒/页。"), sec))
+    local msg = has_data
+        and string.format(L("当前设置翻页间隔：%d 秒/页。"), sec)
+        or string.format(L("已按默认间隔 %d 秒/页开启，可自动设置学习你的节奏。"), sec)
+    show_info(msg)
     logger.info("aat: use learned sec=", sec)
 end
 
@@ -875,10 +882,10 @@ show_dialog_enable = function()
     local learned = has_learned(S.conf) and S.conf.learned_sec or nil
     local label = learned
         and string.format(L(CFG.LANG.current), learned)
-        or L(CFG.LANG.use_learned)
+        or string.format(L(CFG.LANG.use_learned), CFG.default_interval)
     show_buttons(L(CFG.LANG.b_title), L(CFG.LANG.b_body), {
         {
-            { text = label, enabled = (learned ~= nil), fn = action_use_learned },
+            { text = label, fn = action_use_learned },
             { text = L(CFG.LANG.retrain), fn = function() start_collection() end },
         },
         {

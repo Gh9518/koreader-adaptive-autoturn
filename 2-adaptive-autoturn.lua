@@ -829,9 +829,7 @@ start_collection = function()
     S.hint_end = (now_s() or 0) + CFG.hint_timeout
     S.suspended_phase = nil
 
-    show_info(string.format(
-        L("即将开始采集：采够 %d 个翻页间隔，或读满 %d 分钟后自动结束（最长 %d 分钟）。本提示 %d 秒后自动关闭，之后开始分析采集；期间自动翻页已关闭，请正常手动翻页。"),
-        CFG.target_samples, CFG.adaptive_min_minutes, CFG.train_timeout_min, CFG.hint_timeout))
+    show_info(L("正在学习翻页节奏，请正常手动翻页。"))
     logger.info(string.format("aat: page hint shown, collect in %ss", tostring(CFG.hint_timeout)))
 
     -- 只用一个任务句柄驱动「提示关闭 → 开始采集」，切书/中止/休眠时可 unschedule。
@@ -1371,9 +1369,14 @@ local function wrap_menu(inst)
                     end
                     return true
                 end
-                -- pending / collecting 期间不重复弹窗 B。
+                -- pending / collecting 期间再次点击 = 用户主动取消采集。
                 if S.phase == "pending" or S.phase == "collecting" then
-                    return orig_cb(menu)
+                    logger.info("aat: autoturn clicked during collection -> abort")
+                    abort_collection(L("已取消采集，自动翻页保持关闭。"))
+                    if type(menu) == "table" and type(menu.updateItems) == "function" then
+                        pcall(menu.updateItems, menu)
+                    end
+                    return true
                 end
                 -- 关→开：拦下，改为弹窗 B（由补丁自己决定间隔方式）
                 logger.info("aat: intercepted autoturn enable -> dialog B")
@@ -1411,8 +1414,13 @@ local function wrap_switch_methods(inst)
     S.had_own_switch = (rawget(inst, name) ~= nil)
     S.orig_switch = orig
     inst[name] = function(this, ...)
-        -- pending（页面提示中）/ collecting（采集中）都不重复弹窗 B。
-        if not is_enabled(this) and S.phase ~= "collecting" and S.phase ~= "pending" then
+        -- pending / collecting 期间再次点击 = 用户主动取消采集。
+        if S.phase == "collecting" or S.phase == "pending" then
+            logger.info(string.format("aat: switch %s clicked during collection -> abort", name))
+            abort_collection(L("已取消采集，自动翻页保持关闭。"))
+            return true
+        end
+        if not is_enabled(this) then
             logger.info(string.format("aat: intercepted switch %s -> dialog B", name))
             show_dialog_enable()
             return true

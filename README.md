@@ -38,12 +38,12 @@ A few decisions follow from that idea:
 
 **Trigger.** When you toggle AutoTurn **off → on** from the menu, the patch intercepts the action and shows an interval dialog. Switching it **on → off** closes it immediately, without the native "set time / disable" dialog. Opening a book is completely silent.
 
-**The interval dialog** offers four choices:
+**The interval dialog** asks "About to enable auto page turning — choose the interval setting" and offers four choices:
 
 | Choice | Behaviour |
 | --- | --- |
-| Current interval: X s/page | Enable AutoTurn immediately at the stored interval; the title shows the current interval. Greyed out as "Use learned value" until a value exists. |
-| Retrain | Learn a new interval from your manual page turns. |
+| Current interval: X s/page | Return straight to reading and enable AutoTurn at the stored interval, then hint "Current page-turn interval" for 3 seconds before auto-dismissing. Greyed out as "Use learned value" until a value exists. |
+| Auto-set | Learn a new interval from your manual page turns, also with a 3-second hint before collecting. |
 | Set manually | Enter an integer from 3 to 120 seconds; invalid input is rejected and you can retry. |
 | Cancel | Leave AutoTurn off, change nothing. |
 

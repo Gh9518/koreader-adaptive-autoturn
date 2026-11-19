@@ -167,6 +167,7 @@ Enabling AutoTurn also updates AutoTurn's own `autoturn_timeout_seconds` / `auto
 - **Paged view only.** Switching to scroll mode aborts collection with a message.
 - The learned interval is global. If your pace differs sharply between, say, comics and dense prose, use *Set manually* for those sessions.
 - Not tested on every device and KOReader version combination. Reports about specific firmware and plugin versions are very welcome.
+- **Rapid-tap protection:** the patch keeps only one of its own dialogs open at a time, closing any previous one before showing a new selector or input box, so fast repeated taps cannot stack windows and virtual keyboards. If you use a third-party IME plugin such as `pinyin_enhancement`, it is known to conflict with KOReader's input box during Chinese Pinyin entry and can crash it (`inputtext.lua addChars(nil)`; unrelated to this patch). This patch's rapid-tap guard greatly reduces the trigger, but a full fix requires updating/disabling that IME plugin or switching to the English/number keyboard for manual setup.
 
 ## Contributing
 

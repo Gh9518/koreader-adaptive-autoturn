@@ -1397,8 +1397,13 @@ local function wrap_menu(inst)
                     end
                     return true
                 end
-                -- 关→开：拦下，改为弹窗 B（由补丁自己决定间隔方式）
-                logger.info("aat: intercepted autoturn enable -> dialog B")
+                -- 关→开：先关掉底层设置菜单，再弹窗 B。
+                -- 目的：① 选任一选项后直接回到阅读页，不停留在设置页面；
+                -- ② 点「手动设置」时屏幕只有输入框一个弹窗，不与菜单叠加。
+                logger.info("aat: intercepted autoturn enable -> dialog B, close parent menu")
+                if type(menu) == "table" then
+                    pcall(function() UIManager:close(menu) end)
+                end
                 show_dialog_enable()
                 return true
             end

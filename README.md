@@ -36,7 +36,7 @@ A few decisions follow from that idea:
 
 ## What it does
 
-**Trigger.** When you toggle AutoTurn **off → on** from the menu, the patch intercepts the action and shows an interval dialog. Switching it **on → off** closes it immediately, without the native "set time / disable" dialog. Opening a book is completely silent.
+**Trigger.** When you toggle AutoTurn **off → on** from the menu, the patch first closes the settings menu and shows an interval dialog, so choosing any option returns you straight to the reading page instead of leaving you in the settings menu; "Manual setup" also shows a single input box rather than stacking a dialog behind the menu. Switching it **on → off** closes it immediately, without the native "set time / disable" dialog. Opening a book is completely silent.
 
 **The interval dialog** asks "About to enable auto page turning — set the page-turn interval:" and offers four choices:
 

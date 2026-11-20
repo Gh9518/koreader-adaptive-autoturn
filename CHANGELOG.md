@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Shortened the "Auto setup" page hint to a single line: "Learning your page-turn rhythm, please keep turning pages manually." The 3-second auto-dismiss timing is unchanged.
+- Choosing an option from the interval dialog now closes the underlying settings menu first and returns you straight to the reading page. In particular, "Manual setup" now shows a single input box instead of leaving the settings menu stacked behind it.
 
 ### Fixed
 - Rapid repeated taps on the AutoTurn menu item could stack multiple dialogs and virtual keyboards, which on devices using the third-party `pinyin_enhancement` IME could trigger a KOReader input crash (`inputtext.lua addChars(nil)`). The patch now keeps only one of its own dialogs open at a time, closing any previous one before showing a new dialog or the manual-input box. The underlying crash is in the third-party IME; this reduces the patch-side trigger.

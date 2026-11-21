@@ -1,164 +1,78 @@
 --[[==========================================================================
- 2-adaptive-autoturn.lua  —  KOReader 用户补丁「自适应翻页」
+ 2-adaptive-autoturn.lua — KOReader 用户补丁「自适应翻页」
 ============================================================================
+从用户手动翻页节奏学出 AutoTurn 间隔，不让人猜数字。零侵入：不改源码、
+不建数据文件/目录、不依赖 lfs、删除即还原；全局单值，不为每本书重复训练。
 
-关于本补丁（设计初衷 / 功能 / 安装 / 数据 / 参数）
+安装：放到 koreader/patches/2-adaptive-autoturn.lua（"2-"= late 加载），重启。
+勿与同样包裹 AutoTurn 的补丁同用。卸载：删除或改名 .disabled，重启即还原。
 
-设计初衷：
-  KOReader 自带的 AutoTurn 按固定秒数翻页，用户只能手动猜一个间隔。但阅读
-  速度因人而异，同一人在不同状态下也会变化：太短会没读完就翻，太长要干等。
-  本补丁让阅读器从用户自己的手动翻页节奏里学出间隔，而不是让人去猜数字。
-  实现坚持零侵入：不改 KOReader 源码、不自建数据文件、删除即还原；学习值
-  全局共用一份（同一用户阅读速度相近），不为每本书重复训练。
+功能：开书静默挂 hook；用户从菜单把 Autoturn 关→开时才弹间隔选择框
+（标题「即将开启自动翻页，请设置翻页间隔：」，四项：当前间隔/自动设置/
+手动设置/取消）。「当前间隔」有数据则按 learned_sec 直接开启，无数据则
+提示一次并重弹选择框（不开启）。「开→关」直接关闭（跳过原生选择框、清
+待机标志）。取消=不开启。采集期再点 Autoturn = 取消采集。
 
-安装：
-  把本文件放到 koreader/patches/2-adaptive-autoturn.lua，重启 KOReader。
-  文件名以 "2-" 开头，表示 UIManager 就绪后（late 阶段）加载。
-  请勿与其他同样包裹 AutoTurn 的补丁同时使用（会重复挂钩）。
+自动设置：先弹 hint_timeout(3)s 页面提示，关闭后才 pending→collecting
+（提示期间的翻页不计入）。采集期关闭 Autoturn、纯手动翻页采样。
+结束（先到先结算）：采够 target_samples(40) 有效间隔；或满 adaptive_min_
+minutes(20)min 且样本≥adaptive_min_samples(15) 提前结算；train_timeout_
+min(30)min 兜底。结算写值并开启；样本不足/无数据则仅提示一次后休眠，
+不写值、不按默认值开启。手动设置：InputDialog 输入 3~120 整数写值并开启。
 
-卸载：
-  删除本补丁文件（或改名 .disabled），重启 KOReader 即完全还原。补丁只在
-  运行时做 monkey-patch，不改 Autoturn 源文件、不注册全局量、不改其它模块
-  的持久状态。
+统计口径（双侧只剔除「异常」，合理范围全保留、取全期均值）：
+ 上侧 > 中位数×outlier_factor（离开/走神的超长间隔）；下侧 < max(
+ abs_min_keep, 中位数×small_outlier_ratio)（误触/连翻的相对异常快）。
+ 不做近期加权（越读越快的近期样本会把均值压小导致翻页过快）。
 
-功能说明：
-  * 全局单值：所有书共用一个学习值 learned_sec，存进 G_reader_settings 的
-    adaptive_autoturn 项（KOReader 会自动写进 settings.reader.lua）。
-    同一用户阅读速度相近，不做按书隔离。本补丁不创建任何目录、不写任何
-    数据文件、不依赖 lfs。
-  * 触发 = 「用户开启自动翻页」：开书时不打扰用户，补丁只静默挂好 hook；
-    当用户从菜单把 Autoturn 由「关→开」时（wrap_menu /
-    wrap_switch_methods 拦截）才弹出间隔选择框：
-      标题「即将开启自动翻页，请设置翻页间隔：」；四项：当前间隔 / 自动设置 / 手动设置 / 取消。
-    有数据时第一项显示「当前间隔：X 秒/页」并直接按该值开启；无数据时显示
-    「当前间隔：暂无数据」，点击后提示一次并重弹选择框，引导选自动/手动设置，不开启。
-    「开→关」直接关闭（跳过原生「设置时间/禁用」选择框，清待机标志）。
-    取消 = 不开启，保持关闭。
-  * 自适应学习（自动设置）：选「自动设置」即进入流程。先弹一个页面提示，
-    默认 hint_timeout(3) 秒自动关闭；提示关闭后才正式开始分析采集
-    （pending→collecting），刚点完按钮、提示还在时的翻页不会计入样本。
-    采集期关闭 Autoturn、纯手动翻页采样。
-  * 结束条件（先到先结算）：采够 target_samples(40) 个有效间隔即自动结束；
-    或采集满 adaptive_min_minutes(20) 分钟且样本 >= adaptive_min_samples(15)
-    即提前结算（慢速读者无需等满 30 分钟）；train_timeout_min(30) 分钟为最终
-    兜底超时。结算后写学习值并开启 Autoturn；有效样本不足 / 无数据则不开启，
-    仅提示一次后休眠，不写值、不按任何默认值开启。
-  * 手动设置：InputDialog 输入 3~120 的整数，写入学习值并开启 Autoturn。
-  * 统计口径：双侧只剔除「异常」间隔、合理范围内一律保留、取全期均值。
-      - 上侧（特别大）：> 中位数 × outlier_factor，离开/走神造成的超长间隔。
-      - 下侧（特别小）：采样阶段 gap < abs_min_keep(6s) 直接不入池（误触 /
-        连翻，例如 5s 的误触双击；仍更新计时基准，不污染后续间隔）；统计阶段
-        再剔除 < max(abs_min_keep, 中位数 × small_outlier_ratio) 的相对异常
-        小值。两层都只针对「异常快」，不会动合理范围内的偏小值。
-      - 不做近期加权：越读越快的近期样本会把均值压小、导致翻页过快；
-        全期均值保留所有合理值，更贴近真实、偏从容的阅读节奏。
+参数（顶部 CFG 区，改完重启生效）：
+ setting_key=adaptive_autoturn | hint_timeout=3 | target_samples=40 |
+ train_timeout_min=30 | adaptive_min_minutes=20 | adaptive_min_samples=15 |
+ min_interval=2 | abs_min_keep=6 | max_interval=300 | burst_count=3 |
+ min_samples=8 | min_after_trim=5 | outlier_factor=3 |
+ small_outlier_ratio=0.4 | min_sec/max_sec=3/120 | suspend_sec=86400
 
-真实接口适配（依据 KOReader 源码核实，运行时先探测再挂钩）：
-  * KOReader 没有 ReaderUI:onReaderReady() 方法，真实就绪点是
-    Event:new("ReaderReady", doc_settings)（readerui.lua:517，handler 名为
-    "onReaderReady"）。本补丁包裹 ReaderUI 实例的 handleEvent，在原逻辑之后
-    捕获该事件；并校验 this.document 存在，避免在文件管理器等界面误弹窗。
-    插件实例创建于 readerui.lua:465，早于 ReaderReady，因此 hook 来得及挂。
-  * AutoTurn **没有** enable / disable / toggle / setEnabled 公开开关方法。
-    真实「开启」发生在 addToMainMenu 生成的 menu_items.autoturn.callback 里：
-    直接设 enabled / autoturn_sec / G_reader_settings，再 _unschedule()+_start()
-    （plugins/autoturn.koplugin/main.lua:135-171）。
-    真实字段：autoturn_sec、autoturn_distance、enabled、last_action_time、task；
-    真实方法：_enabled()、_schedule()、_unschedule()、_start()、addToMainMenu()。
-    本补丁先 pcall 探测候选开关方法；探测不到时回退到包裹真实的
-    addToMainMenu 产物（menu_items.autoturn.callback）来拦截「关→开」；
-    两者都拿不到才 logger.warn 并放弃拦截（此时补丁静默，不影响原生行为）。
-    挂起/恢复一律用 pcall 探测到的真实字段与方法（enabled + autoturn_sec +
-    _unschedule/_schedule），绝不硬编码不存在的符号。
-    「当前间隔/自动设置/手动设置」的开启交回 AutoTurn 原生路径：补齐
-    原生 callback 的三项副作用（写 autoturn_timeout_seconds / autoturn_enabled、
-    挂 self.onResume = self._onResume），再 _unschedule() + _start()，让
-    PluginShare.pause_auto_suspend 由原生 _start(true)/_unschedule(false) 成对
-    管理。补丁绝不单边写这个全局标志，否则设备会一直无法自动待机，与电源
-    管理争用（锁屏/唤醒卡死根因）。采集期挂起时把 onResume 摘掉并存入快照，
-    避免唤醒时原生 _start 把自动翻页重新打开。
-  * 页面事件：ReaderPaging 派发 PageUpdate(number, orig_mode)（:1150），
-    ReaderRolling 派发 PageUpdate(page)（:1097 等）。两者都在真实翻页时派发
-    PageUpdate，故本补丁以 PageUpdate 为唯一页码信号；PosUpdate 是「位置」级
-    事件（滚动/同页移动也会发），拿来计页会重复计数，因此不采它。
-    事件只给新页码，不给 prev，本补丁自己维护 last_page 算 new-prev。
-  * GotoViewRel **不是跳转**：它同时被手动翻页（key_events args=1）与
-    Autoturn 自动翻页使用（main.lua:37）。因此 A5 只把绝对跳转类事件
-    （GotoPage / GotoPercent / 目录/书签/搜索定位）当跳转；自动翻页由
-    auto_firing 标记（包裹 AutoTurn._schedule）单独识别。
-  * 滚动模式：真实判定是 ui.view.view_mode == "scroll"（readerrolling.lua），
-    命中即中止采集并提示（A1）。
-  * 时间：采样间隔 dt、采集截止 collect_end、页面提示截止 hint_end 统一用
-    UIManager:getElapsedTimeSinceBoot()（= CLOCK_MONOTONIC + 累计待机时长，
-    即含休眠的墙上单调时钟），经 ui/time.to_number() 转秒。UIManager:scheduleIn
-    用纯 CLOCK_MONOTONIC（休眠期间不走），KOReader 唤醒时会平移任务队列，
-    因此补丁的两个定时任务只是「到点叫醒复核」的触发器，是否真正到点一律
-    用 collect_end / hint_end 判定，锁屏再久也不会把 30 分钟拖成 57 分钟。
-    onSuspend 撤销补丁全部定时任务、onResume 按 S.phase 幂等重建（不依赖
-    挂起时的记账，挂起事件万一丢失也能兜底），且不与 AutoTurn 原生 _start()
-    重排的 task 叠加；挂起与唤醒无论 idle 还是采集期都各打一行日志，真机
-    排查时可据此确认事件确实送达补丁。AutoTurn.last_action_time 的比较发生
-    在 fts 域，回填时保留原始值。本补丁不写任何文件。
-  * 内存：关书（onCloseDocument）即还原全部 hook 并释放 S.ui / S.inst /
-    S.samples / S.probe / S.conf，不把销毁后的 ReaderUI（含 mupdf 文档）
-    钉在内存里导致文件管理器期间无法回收；handleEvent 包装以函数引用直调
-    pcall、不新建闭包；页面事件只在采集期处理，idle 翻页零分配、零时钟
-    调用。补丁自排的全部定时任务（含非法输入后的延迟重开输入框）都登记
-    句柄并随 clear_timers 一并撤销，重开任务体校验关书后不再弹窗。
-  * ButtonDialog 的按钮回调不会自动关闭（buttontable.lua:80-85 只调
-    btn_entry.callback），必须显式 UIManager:close(dlg)。
-    ButtonTable 支持 enabled=false 置灰按钮（button.lua:485）。InputDialog
-    用 input_type="number" + getInputText()，按钮回调同样不自动关闭。
+真实接口考证（依据 KOReader 源码，运行时先 pcall 探测再挂钩）：
+ * 就绪点非 onReaderReady 方法，而是 Event("ReaderReady")（readerui.lua:517
+   handler=onReaderReady）。包裹 ReaderUI.handleEvent，在原逻辑后捕获，校验
+   this.document 存在。插件实例创建于 readerui.lua:465，早于 ReaderReady。
+ * AutoTurn 无公开开关方法（无 enable/disable/toggle/setEnabled）。开启发生在
+   addToMainMenu 的 menu_items.autoturn.callback（main.lua:135-171）：设
+   enabled/autoturn_sec/G_reader_settings，再 _unschedule()+_start()。真实字段
+   autoturn_sec/autoturn_distance/enabled/last_action_time/task；真实方法
+   _enabled/_schedule/_unschedule/_start/addToMainMenu。探测不到开关方法时
+   回退包裹 addToMainMenu 产物拦截关→开；都拿不到则 warn 放弃（静默不影响原生）。
+ * 「当前间隔/自动设置/手动设置」开启交回原生路径：补齐 callback 三项副作用
+   （写 autoturn_timeout_seconds/autoturn_enabled、挂 self.onResume=self._onResume）
+   再 _unschedule()+_start()，让 PluginShare.pause_auto_suspend 由原生成对管理。
+   补丁绝不单边写该全局标志（否则一直无法自动待机，与电源管理争用=锁屏/唤醒
+   卡死根因）。采集期挂起摘掉 onResume 存快照，避免唤醒时原生重启自动翻页。
+ * 页面信号只用 PageUpdate（ReaderPaging/ReaderRolling 真翻页时派发）；PosUpdate
+   是位置级事件（同页移动也发）会重复计数，不采。事件只给新页码，自维护
+   last_page 算 new-prev。GotoViewRel 非跳转（手动/自动翻页共用，main.lua:37），
+   A5 只把绝对跳转类事件当跳转；自动翻页由 auto_firing 计数（包裹 _schedule）识别。
+ * 滚动模式：ui.view.view_mode=="scroll"（readerrolling.lua），命中中止采集。
+ * 双时钟：间隔/dt/collect_end/hint_end 用 getElapsedTimeSinceBoot（= MONOTONIC
+   + 累计待机，含休眠的墙上单调时钟，经 ui/time.to_number 转秒）；scheduleIn 用
+   纯 CLOCK_MONOTONIC（休眠不走，唤醒会平移队列），故定时任务只是「到点叫醒复核」
+   触发器，是否到点一律用 collect_end/hint_end 判定，锁屏再久也不拖长。
+   onSuspend 撤全部定时任务、onResume 按 phase 幂等重建（丢失挂起事件也兜底），
+   不与原生 _start() 重排的 task 叠加；挂起/唤醒各打一行日志便于真机排查。
+ * 内存/热路径：关书 onCloseDocument 还原全部 hook 并释放 S.ui/S.inst/S.samples/
+   S.probe/S.conf（不把含 mupdf 文档的 ReaderUI 钉住）；handleEvent 包装以函数
+   引用直调 pcall 不新建闭包；页面事件仅采集期处理，idle 零分配零时钟调用。
+   自排定时任务（含非法输入延迟重开输入框）都登记句柄随 clear_timers 撤销，
+   任务体校验关书后不弹窗。防自激 auto_firing 用计数：_schedule 内同步派发
+   GotoViewRel 会重入 handleEvent，计数保证整段窗口都识别为自动翻页。
+ * ButtonDialog 按钮回调不自动关闭（buttontable.lua:80-85），须显式 close；
+   ButtonTable 支持 enabled=false 置灰（button.lua:485）；InputDialog 用
+   input_type="number" + getInputText()，按钮回调同样不自动关闭。
 
-数据格式：
-  学习值存于 G_reader_settings.adaptive_autoturn（KOReader 会写进
-  settings.reader.lua），结构为：
-    {
-      learned_sec   = 42,   -- 全局学习值（秒）
-      trained       = true, -- 是否已有有效学习值
-      last_duration = 30,   -- 训练超时兜底（分钟），固定 train_timeout_min
-    }
-  （last_duration 表示本次训练所用的兜底超时分钟数。）
-  读取用 pcall(G_reader_settings:readSetting, key)，出错/字段非法一律视为
-  「无数据」，不崩。本补丁不创建任何目录、不写任何数据文件、不依赖 lfs。
-
-参数表（文件顶部 CFG 常量区，改完重启生效）：
-  | 参数                 | 默认      | 说明 |
-  | setting_key          | adaptive_autoturn | 存于 G_reader_settings 的设置项名 |
-  | hint_timeout         | 3         | 交互后页面提示自动关闭秒数，关闭后才开始采集 |
-  | target_samples       | 40        | 采够这么多个有效间隔即自动结束（主结束条件） |
-  | train_timeout_min    | 30        | 兜底超时（分钟），防止一直采不够 |
-  | adaptive_min_minutes | 20        | 采满这么久且样本够 adaptive_min_samples 即提前结算 |
-  | adaptive_min_samples | 15        | 提前结算所需的最少有效样本数 |
-  | min_interval         | 2         | 连翻/抖动阈值（秒），B1 丢弃并计 burst |
-  | abs_min_keep         | 6         | 特别小的异常间隔下限（秒），低于它不入池；如 5s |
-  | max_interval         | 300       | 最长有效间隔（秒），B2 丢弃 |
-  | burst_count          | 3         | 连续快翻判定「翻找模式」阈值 |
-  | min_samples          | 8         | 采集成功最低有效样本数 |
-  | min_after_trim       | 5         | 双侧剔除异常值后剩余下限 |
-  | outlier_factor       | 3         | 上侧：剔除 > 中位数×此值的特别大间隔 |
-  | small_outlier_ratio  | 0.4       | 下侧：剔除 < 中位数×此值的相对异常小值 |
-  | min_sec / max_sec    | 3 / 120   | 学习值 clamp 区间 |
-
-约束落实：
-  * 纯 Lua 5.1；全部局部量，零全局写入（luac -l 校验 SETGLOBAL=0）。
-  * 所有 require、接口探测、UI、hook 均包 pcall；任一步失败仅
-    logger.warn，绝不中断 KOReader 启动。最外层再包一层 pcall(apply)。
-  * 过滤与统计拆成独立纯函数（sorted_copy / quantile / mean /
-    trim_outliers / compute_learned），便于离线单测。
-  * 唯一持久状态是 G_reader_settings.adaptive_autoturn；不创建目录、不写文件、
-    不依赖 lfs、不改 Autoturn 源文件。开启时另由 AutoTurn 原生 _start() 维护
-    它自己的 autoturn_enabled / autoturn_timeout_seconds 与 PluginShare 标志。
-  * 定时器生命周期：clear_timers() 统一撤销 hint_task / collect_task /
-    manual_retry_task；开新书、关文档、换书 detach、结算、中止、休眠都
-    无条件调用，杜绝幽灵任务。
-  * 内存与热路径：关书即释放全部实例/文档引用；handleEvent 包装不新建
-    闭包；页面事件仅在采集期处理，日常阅读状态下补丁在事件路径上的开销
-    趋近于零。
-  * 防自激 auto_firing 用计数：_schedule 内同步派发 GotoViewRel 会重入
-    handleEvent，菜单打断 / 嵌套调度时布尔会被内层提前清掉，计数保证整段
-    窗口都被识别为自动翻页，不会误计入手动样本。
-  * 删除补丁文件后，运行时包裹随进程消失，Autoturn 恢复原生行为。
+约束：纯 Lua 5.1、全局部量、零全局写入（luac -l 校验 SETGLOBAL=0）；require/
+接口探测/UI/hook 全包 pcall，失败仅 logger.warn，最外层再包 pcall(apply)；
+过滤统计拆纯函数便于离线单测；唯一持久状态 G_reader_settings.adaptive_autoturn。
+勾选框：onMenuChoice 以 item.callback() 无参调用，checked_func 只在
+Menu:updateItems() 重绘——dialog B 异步改状态后须主动 updateItems 才刷新勾选。
 ==========================================================================]]
 
 -- ---------------------------------------------------------------- 依赖探测 --
@@ -529,7 +443,15 @@ end
 local function show_info(text, timeout)
     if not (ok_IM and type(InfoMessage) == "table") then return end
     pcall(function()
-        UIManager:show(InfoMessage:new{ text = text, timeout = timeout or CFG.hint_timeout })
+        -- 提示去重：弹新提示前先关掉补丁自己上一次弹的那条。连续操作（开启后原生
+        -- _start 的提示、紧接着的补丁提示、再关闭的提示）否则会在屏幕上叠成"重影"。
+        if S.last_info then
+            pcall(UIManager.close, UIManager, S.last_info)
+            S.last_info = nil
+        end
+        local im = InfoMessage:new{ text = text, timeout = timeout or CFG.hint_timeout }
+        UIManager:show(im)
+        S.last_info = im
     end)
 end
 
@@ -541,6 +463,66 @@ local function close_active_dialog()
         local d = S.active_dialog
         S.active_dialog = nil
         pcall(function() UIManager:close(d) end)
+    end
+end
+
+-- 定位并关闭「承载 autoturn 菜单项的那个菜单 widget」。
+-- 关键：KOReader 的 Menu:onMenuChoice(item) 调用 item.callback() 时不传任何参数
+-- （menu.lua: default to call item callback），所以 addToMainMenu 里那层 callback
+-- 的 menu 形参永远是 nil；照旧 UIManager:close(menu) 什么都不会关掉。表现就是
+-- 「自动翻页间隔已设为 N 秒」提示框浮在设置菜单之上（重叠），且选完不回阅读页。
+-- 改为：在 callback 触发那一刻从窗口栈主动找菜单 widget。菜单具备 updateItems /
+-- onMenuChoice / item_table 等特征，用它把 InfoMessage / ButtonDialog 排除掉。
+local function menu_like(w)
+    return type(w) == "table" and
+        (type(w.updateItems) == "function" or type(w.onMenuChoice) == "function"
+         or type(w.item_table) == "table")
+end
+
+local function find_menu_widget()
+    -- 首选：当前最顶层可见 widget（点击菜单项时它就是那个菜单）。
+    if S.probe and S.probe.getTopmost then
+        local ok, top = pcall(UIManager.getTopmostVisibleWidget, UIManager)
+        if ok and menu_like(top) then return top end
+    end
+    -- 兜底：从栈顶向下扫窗口栈，找第一个菜单特征 widget；栈项是 {x=,y=,widget=}。
+    local stack = UIManager._window_stack
+    if type(stack) == "table" then
+        for i = #stack, 1, -1 do
+            local entry = stack[i]
+            local w = (type(entry) == "table") and entry.widget or nil
+            if menu_like(w) then return w end
+        end
+    end
+    return nil
+end
+
+local function close_menu_widget(menu)
+    if not menu then return false end
+    local ok = pcall(UIManager.close, UIManager, menu)
+    if ok then logger.info("aat: parent menu closed") end
+    return ok
+end
+
+-- 刷新「自动翻页」菜单项的勾选框（checked_func）。
+-- 根因：KOReader 的 Menu:onMenuChoice 以 item.callback() 无参调用，勾选图标只在
+-- Menu:updateItems() 重绘时重新求值 checked_func。原生 autoturn 靠
+-- check_callback_updates_menu=true 在 callback 返回后自动 updateItems 刷新，但本
+-- 补丁把 callback 换成「弹 dialog B」——那一刻 enabled 还没变；等用户在 dialog B
+-- 里选定、状态真正改变后，菜单早已不再刷新，勾选框就停留在旧状态（用户看到
+-- 「明明开了/关了，对勾却没变」）。因此在每次开关状态落定后主动 updateItems 一次。
+-- 注意：find_menu_widget 只认窗口栈里现存的菜单；关→开时菜单已被关闭，属正常——
+-- 那种情况用户回到阅读页，下次打开菜单时 checked_func 自会读到最新状态。
+-- 全程 pcall，找不到菜单或 widget 无该方法都静默跳过，不影响开关本身。
+-- S.ref_menu：关→开时菜单会被关闭并移出窗口栈，但 KOReader 复用同一菜单对象，
+-- 故在 callback 触发瞬间先存下引用；异步 dialog B 结束后仍能对它 updateItems，
+-- 这样下次打开菜单勾选框已是最新状态。用完即清，换书/关书也清。
+local function refresh_autoturn_check()
+    local menu = S.ref_menu or find_menu_widget()
+    S.ref_menu = nil
+    if menu and type(menu.updateItems) == "function" then
+        pcall(menu.updateItems, menu)
+        logger.info("aat: menu check refreshed")
     end
 end
 
@@ -646,7 +628,39 @@ local function disable_autoturn(inst)
     -- _unschedule 内置 pause_auto_suspend=false，清掉待机标志，设备可正常锁屏。
     call_unschedule(inst)
     enter_dormant()
+    refresh_autoturn_check()  -- 开→关：让菜单勾选框即时变为未勾选
     logger.info("aat: autoturn disabled (native dialog skipped)")
+end
+
+-- 静默调用原生 _start()：原生 _start() 在真正启用时会 UIManager:show 一条
+-- InfoMessage（"Autoturn is now active..."），随后本补丁的 apply_value /
+-- action_use_learned 又 show_info 弹自己的中文提示，两条叠加就是用户看到的
+-- 「两个框 / 重影」。这里只在 _start() 这次调用期间临时接管 InfoMessage:new，
+-- 把它弹出的那条收集起来，调用后立刻 close；调度 / pause_auto_suspend /
+-- last_action_time 等原生副作用全部照常执行。全程 pcall，且无论如何都恢复
+-- InfoMessage.new，避免把全局类永久改坏。
+local function start_autoturn_silent(inst)
+    local shown = {}
+    local patched = false
+    if ok_IM and type(InfoMessage) == "table" and type(InfoMessage.new) == "function" then
+        local orig_new = InfoMessage.new
+        patched = pcall(function()
+            InfoMessage.new = function(self, o)
+                local w = orig_new(self, o)
+                shown[#shown + 1] = w
+                return w
+            end
+        end)
+        pcall(inst._start, inst)
+        pcall(function() InfoMessage.new = orig_new end)
+    else
+        pcall(inst._start, inst)
+    end
+    -- 关掉原生 _start 弹的那条提示；S.last_info 不清（补丁随后会弹自己的提示）。
+    for _, w in ipairs(shown) do
+        pcall(UIManager.close, UIManager, w)
+    end
+    return patched
 end
 
 -- 开启：把 AutoTurn 原生菜单 callback 的副作用补齐，再交回原生 _start()
@@ -693,12 +707,13 @@ local function resume_autoturn(inst, sec)
     -- （内置把 pause_auto_suspend 置真 + last_action_time + _schedule + 原生提示）。
     call_unschedule(inst)
     if S.probe._start then
-        pcall(inst._start, inst)
+        start_autoturn_silent(inst)  -- 复用原生 _start 副作用，但吞掉它的长提示，杜绝重影
     else
         -- 老版本没有 _start：字段级兜底重排，绝不碰全局待机标志。
         pcall(function() inst.last_action_time = now_raw() or 0 end)
         if S.probe._schedule then pcall(inst._schedule, inst) end
     end
+    refresh_autoturn_check()  -- 关→开：让菜单勾选框即时变为已勾选
     logger.info(string.format("aat: autoturn enabled sec=%s", tostring(sec)))
 end
 
@@ -778,6 +793,7 @@ action_cancel_enable = function()
         call_unschedule(S.inst)
     end
     enter_dormant()
+    refresh_autoturn_check()  -- 取消：确保菜单勾选框为未勾选
     logger.info("aat: enable cancelled, autoturn stays off")
 end
 
@@ -792,6 +808,7 @@ abort_collection = function(msg)
         clear_timers()  -- 即便 idle 也清，杜绝任何残留句柄
     end
     enter_dormant()  -- 中止即退场：释放样本与全部运行时态
+    refresh_autoturn_check()  -- 采集取消：autoturn 保持关闭，刷新勾选框
     show_info(msg, 6)
 end
 
@@ -1378,32 +1395,33 @@ local function wrap_menu(inst)
             local item = menu_items and menu_items.autoturn
             if type(item) ~= "table" or type(item.callback) ~= "function" then return end
             local orig_cb = item.callback
-            item.callback = function(menu)
+            -- 注意：KOReader 的 onMenuChoice 以 item.callback() 调用，不传 menu 形参！
+            -- 必须自己从窗口栈定位菜单（find_menu_widget），不能信 function(menu)。
+            item.callback = function()
+                local menu = find_menu_widget()
+                if menu then S.ref_menu = menu end  -- 供异步 dialog 结束后刷新勾选框
                 if is_enabled(this) then
                     -- 已开启 → 用户点菜单要关闭：跳过原生「设置时间/禁用」选择框，
                     -- 直接执行原生禁用的全部副作用（含待机标志清位）。
-                    disable_autoturn(this)
-                    if type(menu) == "table" and type(menu.updateItems) == "function" then
-                        pcall(menu.updateItems, menu)
-                    end
+                    logger.info("aat: autoturn is on -> tap turns it off directly")
+                    disable_autoturn(this)  -- 内部 refresh_autoturn_check 会刷新勾选框
+                    -- 给出明确的「已关闭」反馈：之前关闭毫无提示，而开启会弹提示，
+                    -- 用户点一次以为没生效、再点又变「关→开」弹回弹窗 B，反复循环。
+                    -- show_info 会自动关掉上一条残留提示，屏幕始终只留一条。
+                    show_info(L("已关闭自动翻页。"))
                     return true
                 end
                 -- pending / collecting 期间再次点击 = 用户主动取消采集。
                 if S.phase == "pending" or S.phase == "collecting" then
                     logger.info("aat: autoturn clicked during collection -> abort")
-                    abort_collection(L("已取消采集，自动翻页保持关闭。"))
-                    if type(menu) == "table" and type(menu.updateItems) == "function" then
-                        pcall(menu.updateItems, menu)
-                    end
+                    abort_collection(L("已取消采集，自动翻页保持关闭。"))  -- 内部已刷新勾选框
                     return true
                 end
-                -- 关→开：先关掉底层设置菜单，再弹窗 B。
+                -- 关→开：先真正关掉底层设置菜单，再弹窗 B。
                 -- 目的：① 选任一选项后直接回到阅读页，不停留在设置页面；
                 -- ② 点「手动设置」时屏幕只有输入框一个弹窗，不与菜单叠加。
                 logger.info("aat: intercepted autoturn enable -> dialog B, close parent menu")
-                if type(menu) == "table" then
-                    pcall(function() UIManager:close(menu) end)
-                end
+                close_menu_widget(menu)
                 show_dialog_enable()
                 return true
             end
@@ -1459,6 +1477,7 @@ local function detach_hooks()
     -- ⑥ 换书 detach 时无条件撤销全部定时句柄并复位采集态，杜绝幽灵任务。
     clear_timers()
     close_active_dialog()
+    S.ref_menu = nil  -- 释放缓存的菜单 widget 引用，避免钉住旧实例
     S.collect_end = nil
     S.hint_end = nil
     S.suspended_phase = nil

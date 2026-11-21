@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Rapid repeated taps on the AutoTurn menu item could stack multiple dialogs and virtual keyboards, which on devices using the third-party `pinyin_enhancement` IME could trigger a KOReader input crash (`inputtext.lua addChars(nil)`). The patch now keeps only one of its own dialogs open at a time, closing any previous one before showing a new dialog or the manual-input box. The underlying crash is in the third-party IME; this reduces the patch-side trigger.
+- Eliminated overlapping on-screen notices: consecutive enable/disable/hint operations no longer stack multiple `InfoMessage` popups, and enabling AutoTurn no longer shows both the native English notice and the patch's own Chinese notice at the same time.
+- The menu callback no longer relies on a `menu` argument (KOReader calls `item.callback()` with no arguments). It now locates the settings menu from the window stack, so choosing an interval reliably closes the menu and returns to the reading page.
+- The AutoTurn checkbox in the settings menu now refreshes immediately after enable, disable, cancel, or collection abort, instead of showing a stale check state until the next menu redraw.
+- Turning AutoTurn off now shows a clear "disabled" confirmation, avoiding repeated taps caused by the lack of feedback.
 
 ### Performance
 - Reduced collection-phase memory: page-turn intervals are now stored as plain numbers instead of per-sample tables with an unused timestamp field; the temporary copy during statistics was removed. Peak sample-array heap for a full 40-sample session drops from ~6.7 KB to ~1.1 KB (−84%) on Lua 5.1. No change to interval computation or learned values.

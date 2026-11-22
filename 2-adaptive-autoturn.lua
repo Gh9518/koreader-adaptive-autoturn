@@ -1397,6 +1397,8 @@ local function wrap_menu(inst)
             local orig_cb = item.callback
             -- 注意：KOReader 的 onMenuChoice 以 item.callback() 调用，不传 menu 形参！
             -- 必须自己从窗口栈定位菜单（find_menu_widget），不能信 function(menu)。
+            -- 三个分支统一：点 Autoturn 菜单项后一律先退出设置菜单回阅读页，
+            -- 再执行对应动作/弹框，避免操作完还停留在设置页。
             item.callback = function()
                 local menu = find_menu_widget()
                 if menu then S.ref_menu = menu end  -- 供异步 dialog 结束后刷新勾选框
@@ -1404,6 +1406,7 @@ local function wrap_menu(inst)
                     -- 已开启 → 用户点菜单要关闭：跳过原生「设置时间/禁用」选择框，
                     -- 直接执行原生禁用的全部副作用（含待机标志清位）。
                     logger.info("aat: autoturn is on -> tap turns it off directly")
+                    close_menu_widget(menu)  -- 关闭后退出菜单回阅读页
                     disable_autoturn(this)  -- 内部 refresh_autoturn_check 会刷新勾选框
                     -- 给出明确的「已关闭」反馈：之前关闭毫无提示，而开启会弹提示，
                     -- 用户点一次以为没生效、再点又变「关→开」弹回弹窗 B，反复循环。
@@ -1414,6 +1417,7 @@ local function wrap_menu(inst)
                 -- pending / collecting 期间再次点击 = 用户主动取消采集。
                 if S.phase == "pending" or S.phase == "collecting" then
                     logger.info("aat: autoturn clicked during collection -> abort")
+                    close_menu_widget(menu)  -- 取消采集后退出菜单回阅读页
                     abort_collection(L("已取消采集，自动翻页保持关闭。"))  -- 内部已刷新勾选框
                     return true
                 end

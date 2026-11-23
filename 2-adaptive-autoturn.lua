@@ -71,8 +71,8 @@ min(30)min 兜底。结算写值并开启；样本不足/无数据则仅提示�
 约束：纯 Lua 5.1、全局部量、零全局写入（luac -l 校验 SETGLOBAL=0）；require/
 接口探测/UI/hook 全包 pcall，失败仅 logger.warn，最外层再包 pcall(apply)；
 过滤统计拆纯函数便于离线单测；唯一持久状态 G_reader_settings.adaptive_autoturn。
-勾选框：onMenuChoice 以 item.callback() 无参调用，checked_func 只在
-Menu:updateItems() 重绘——dialog B 异步改状态后须主动 updateItems 才刷新勾选。
+勾选框：onMenuChoice 以 item.callback() 无参调用，checked_func 由 KOReader
+在下次打开菜单时自动求值；补丁不主动重绘已关闭的菜单（避免重入 updateItems）。
 ==========================================================================]]
 
 -- ---------------------------------------------------------------- 依赖探测 --
@@ -504,27 +504,8 @@ local function close_menu_widget(menu)
     return ok
 end
 
--- 刷新「自动翻页」菜单项的勾选框（checked_func）。
--- 根因：KOReader 的 Menu:onMenuChoice 以 item.callback() 无参调用，勾选图标只在
--- Menu:updateItems() 重绘时重新求值 checked_func。原生 autoturn 靠
--- check_callback_updates_menu=true 在 callback 返回后自动 updateItems 刷新，但本
--- 补丁把 callback 换成「弹 dialog B」——那一刻 enabled 还没变；等用户在 dialog B
--- 里选定、状态真正改变后，菜单早已不再刷新，勾选框就停留在旧状态（用户看到
--- 「明明开了/关了，对勾却没变」）。因此在每次开关状态落定后主动 updateItems 一次。
--- 注意：find_menu_widget 只认窗口栈里现存的菜单；关→开时菜单已被关闭，属正常——
--- 那种情况用户回到阅读页，下次打开菜单时 checked_func 自会读到最新状态。
--- 全程 pcall，找不到菜单或 widget 无该方法都静默跳过，不影响开关本身。
--- S.ref_menu：关→开时菜单会被关闭并移出窗口栈，但 KOReader 复用同一菜单对象，
--- 故在 callback 触发瞬间先存下引用；异步 dialog B 结束后仍能对它 updateItems，
--- 这样下次打开菜单勾选框已是最新状态。用完即清，换书/关书也清。
-local function refresh_autoturn_check()
-    local menu = S.ref_menu or find_menu_widget()
-    S.ref_menu = nil
-    if menu and type(menu.updateItems) == "function" then
-        pcall(menu.updateItems, menu)
-        logger.info("aat: menu check refreshed")
-    end
-end
+-- 勾选框（checked_func）由 KOReader 在下次打开菜单 / 自身 updateItems 时自动求值；
+-- 补丁不主动重绘已关闭的菜单，避免 callback 内的重入 updateItems。
 
 -- ButtonDialog 的按钮回调不会自动关闭，统一显式 close 后再执行动作。
 -- enabled 显式给布尔值，避免 nil 被解释成禁用（button.lua 默认 true）。
@@ -628,7 +609,9 @@ local function disable_autoturn(inst)
     -- _unschedule 内置 pause_auto_suspend=false，清掉待机标志，设备可正常锁屏。
     call_unschedule(inst)
     enter_dormant()
-    refresh_autoturn_check()  -- 开→关：让菜单勾选框即时变为未勾选
+    -- 不在这里刷新勾选框：本路径由 callback 同步触发，菜单已被 close_menu_widget
+    -- 关闭，对已退出菜单调 updateItems 是重入重绘（KOReader 在 callback 返回后自身
+    -- 还会 updateItems 一次）。勾选框下次打开菜单时 checked_func 自会读到最新状态。
     logger.info("aat: autoturn disabled (native dialog skipped)")
 end
 
@@ -713,7 +696,6 @@ local function resume_autoturn(inst, sec)
         pcall(function() inst.last_action_time = now_raw() or 0 end)
         if S.probe._schedule then pcall(inst._schedule, inst) end
     end
-    refresh_autoturn_check()  -- 关→开：让菜单勾选框即时变为已勾选
     logger.info(string.format("aat: autoturn enabled sec=%s", tostring(sec)))
 end
 
@@ -793,7 +775,6 @@ action_cancel_enable = function()
         call_unschedule(S.inst)
     end
     enter_dormant()
-    refresh_autoturn_check()  -- 取消：确保菜单勾选框为未勾选
     logger.info("aat: enable cancelled, autoturn stays off")
 end
 
@@ -808,7 +789,8 @@ abort_collection = function(msg)
         clear_timers()  -- 即便 idle 也清，杜绝任何残留句柄
     end
     enter_dormant()  -- 中止即退场：释放样本与全部运行时态
-    refresh_autoturn_check()  -- 采集取消：autoturn 保持关闭，刷新勾选框
+    -- 不在这里刷新勾选框：同「开→关」，菜单已退出，避免重入重绘；
+    -- 下次打开菜单时 checked_func 自会读到最新（关闭）状态。
     show_info(msg, 6)
 end
 
@@ -1232,7 +1214,11 @@ local function on_event_after(this, handler, args)
         if S.phase == "collecting" or S.phase == "pending" then
             S.phase = "idle"
             S.auto_firing = 0
-            restore_autoturn(S.inst)
+            -- 关书只撤销、不恢复：原生 handleEvent 已先跑 AutoTurn.onCloseDocument
+            -- 清掉翻页 task；此处若 restore_autoturn→_start 会重新排定 task，而随后
+            -- S.inst=nil、document 被销毁，task 到点访问已释放的 ReaderUI 实例，可能
+            -- 击穿 UIManager 主循环，并让 pause_auto_suspend 残留在 true。
+            if S.inst then call_unschedule(S.inst) end  -- 幂等兜底，确保 task 与待机标志都清掉
         end
         -- 内存释放：关书后 ReaderUI 与它持有的 mupdf 文档（可达数十 MiB）由
         -- KOReader 销毁，补丁必须同步松手——还原 handleEvent 等全部 hook，
@@ -1401,13 +1387,12 @@ local function wrap_menu(inst)
             -- 再执行对应动作/弹框，避免操作完还停留在设置页。
             item.callback = function()
                 local menu = find_menu_widget()
-                if menu then S.ref_menu = menu end  -- 供异步 dialog 结束后刷新勾选框
                 if is_enabled(this) then
                     -- 已开启 → 用户点菜单要关闭：跳过原生「设置时间/禁用」选择框，
                     -- 直接执行原生禁用的全部副作用（含待机标志清位）。
                     logger.info("aat: autoturn is on -> tap turns it off directly")
                     close_menu_widget(menu)  -- 关闭后退出菜单回阅读页
-                    disable_autoturn(this)  -- 内部 refresh_autoturn_check 会刷新勾选框
+                    disable_autoturn(this)
                     -- 给出明确的「已关闭」反馈：之前关闭毫无提示，而开启会弹提示，
                     -- 用户点一次以为没生效、再点又变「关→开」弹回弹窗 B，反复循环。
                     -- show_info 会自动关掉上一条残留提示，屏幕始终只留一条。
@@ -1418,7 +1403,7 @@ local function wrap_menu(inst)
                 if S.phase == "pending" or S.phase == "collecting" then
                     logger.info("aat: autoturn clicked during collection -> abort")
                     close_menu_widget(menu)  -- 取消采集后退出菜单回阅读页
-                    abort_collection(L("已取消采集，自动翻页保持关闭。"))  -- 内部已刷新勾选框
+                    abort_collection(L("已取消采集，自动翻页保持关闭。"))
                     return true
                 end
                 -- 关→开：先真正关掉底层设置菜单，再弹窗 B。
@@ -1481,7 +1466,6 @@ local function detach_hooks()
     -- ⑥ 换书 detach 时无条件撤销全部定时句柄并复位采集态，杜绝幽灵任务。
     clear_timers()
     close_active_dialog()
-    S.ref_menu = nil  -- 释放缓存的菜单 widget 引用，避免钉住旧实例
     S.collect_end = nil
     S.hint_end = nil
     S.suspended_phase = nil
